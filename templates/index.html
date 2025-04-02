@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Knowledge Graph from Speech</title>
+    <!-- Vis.js CSS -->
+    <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+    <!-- Bootstrap for responsive layout -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f8f9fa;
+        }
+        
+        .navbar {
+            background-color: #343a40;
+            color: white;
+            padding: 0.5rem 1rem;
+        }
+        
+        .container-fluid {
+            padding: 20px;
+        }
+        
+        #graph-container {
+            width: 100%;
+            height: 600px;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            background-color: white;
+        }
+        
+        .card {
+            margin-bottom: 20px;
+            border-radius: 4px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .card-header {
+            background-color: #f1f3f5;
+            font-weight: bold;
+        }
+        
+        .btn-primary {
+            background-color: #0d6efd;
+            border-color: #0d6efd;
+        }
+        
+        .btn-danger {
+            background-color: #dc3545;
+            border-color: #dc3545;
+        }
+        
+        #transcription-display {
+            height: 200px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+        }
+        
+        #query-result {
+            min-height: 80px;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+        
+        .status-bar {
+            padding: 10px;
+            margin-top: 10px;
+            border-radius: 4px;
+        }
+        
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+        
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .settings-panel {
+            padding: 15px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-control {
+            border-radius: 4px;
+        }
+        
+        .audio-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .recording-indicator {
+            display: inline-block;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            background-color: #dc3545;
+            margin-right: 8px;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+
+        .segment-timer {
+            font-size: 14px;
+            margin-left: 10px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <span class="navbar-brand mb-0 h1">Knowledge Graph from Speech</span>
+        </div>
+    </nav>
+
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Left side: Input and Configuration -->
+            <div class="col-md-4">
+                <!-- Settings Panel -->
+                <div class="card">
+                    <div class="card-header">Settings</div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label for="sentence-chunks">Sentence Chunk Size</label>
+                            <input type="number" id="sentence-chunks" class="form-control" value="3" min="1" max="10">
+                            <small class="form-text text-muted">Number of sentences before quick LLM processing</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="slow-chunks">Slow LLM Chunk Size</label>
+                            <input type="number" id="slow-chunks" class="form-control" value="5" min="1" max="10">
+                            <small class="form-text text-muted">Number of quick LLM results before slow LLM processing</small>
+                        </div>
+                        <button id="update-settings" class="btn btn-primary btn-sm">Update Settings</button>
+                    </div>
+                </div>
+                
+                <!-- Audio Input -->
+                <div class="card">
+                    <div class="card-header">Audio Input</div>
+                    <div class="card-body">
+                        <div class="audio-controls">
+                            <button id="start-recording" class="btn btn-primary">Start Recording</button>
+                            <button id="stop-recording" class="btn btn-danger" disabled>Stop Recording</button>
+                            <div id="recording-status" style="display: none;">
+                                <span class="recording-indicator"></span>
+                                <span>Recording</span>
+                                <span id="segment-timer" class="segment-timer">0s</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="text-input">Or type directly:</label>
+                            <textarea id="text-input" class="form-control" rows="3" placeholder="Type your text here and press Enter..."></textarea>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Transcription Display -->
+                <div class="card">
+                    <div class="card-header">Transcription</div>
+                    <div class="card-body">
+                        <div id="transcription-display"></div>
+                    </div>
+                </div>
+                
+                <!-- Query Panel -->
+                <div class="card">
+                    <div class="card-header">Query the Knowledge Graph</div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <input type="text" id="query-input" class="form-control" placeholder="Ask a question about the knowledge graph...">
+                        </div>
+                        <button id="submit-query" class="btn btn-primary">Submit Query</button>
+                        <div id="query-result"></div>
+                    </div>
+                </div>
+                
+                <!-- Status Bar -->
+                <div id="status" class="status-bar info">Ready</div>
+            </div>
+            
+            <!-- Right side: Graph Visualization -->
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header">Knowledge Graph Visualization</div>
+                    <div class="card-body">
+                        <div id="graph-container"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Socket.IO Client Library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <!-- Vis.js Network Library -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <!-- Main JavaScript -->
+    <script type="text/javascript">
+        // Global variables
+        const socket = io();
+        let network = null;
+        let nodes = new vis.DataSet([]);
+        let edges = new vis.DataSet([]);
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let segmentTimer = null;
+        let segmentTime = 0;
+        
+        // DOM Elements
+        const statusDiv = document.getElementById('status');
+        const startRecordingBtn = document.getElementById('start-recording');
+        const stopRecordingBtn = document.getElementById('stop-recording');
+        const recordingStatus = document.getElementById('recording-status');
+        const segmentTimerEl = document.getElementById('segment-timer');
+        const textInput = document.getElementById('text-input');
+        const transcriptionDisplay = document.getElementById('transcription-display');
+        const graphContainer = document.getElementById('graph-container');
+        const queryInput = document.getElementById('query-input');
+        const submitQueryBtn = document.getElementById('submit-query');
+        const queryResult = document.getElementById('query-result');
+        const sentenceChunksInput = document.getElementById('sentence-chunks');
+        const slowChunksInput = document.getElementById('slow-chunks');
+        const updateSettingsBtn = document.getElementById('update-settings');
+        
+        // Initialize Graph Visualization
+        function initializeGraph() {
+            const data = { nodes: nodes, edges: edges };
+            const options = {
+                layout: {
+                    improvedLayout: true
+                },
+                nodes: {
+                    shape: 'box',
+                    font: { size: 14, face: 'arial' },
+                    borderWidth: 1,
+                    shapeProperties: {
+                        borderRadius: 3
+                    }
+                },
+                edges: {
+                    arrows: { to: { enabled: true, scaleFactor: 0.7 } },
+                    font: { size: 12, align: 'middle' },
+                    color: { inherit: 'from' },
+                    smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 }
+                },
+                physics: {
+                    enabled: true,
+                    solver: 'barnesHut',
+                    barnesHut: {
+                        gravitationalConstant: -3000,
+                        centralGravity: 0.1,
+                        springLength: 120,
+                        springConstant: 0.05,
+                        damping: 0.1
+                    },
+                    stabilization: { iterations: 150 }
+                },
+                interaction: {
+                    tooltipDelay: 200,
+                    hover: true,
+                    zoomView: true,
+                    dragView: true
+                }
+            };
+            network = new vis.Network(graphContainer, data, options);
+            
+            // Fit graph to view after stabilization
+            network.on("stabilizationIterationsDone", function () {
+                network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' }});
+            });
+        }
+        
+        // Audio Recording Functions - Fixed version
+        async function setupAudioRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // Store stream globally so we can reuse it for sequential recordings
+                window.audioStream = stream;
+                return true;
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                updateStatus(`Error: ${err.message}`, 'error');
+                return false;
+            }
+        }
+
+        function startRecording() {
+            if (!window.audioStream) {
+                setupAudioRecording().then(success => {
+                    if (success) {
+                        beginSegmentRecording();
+                    }
+                });
+            } else {
+                beginSegmentRecording();
+            }
+        }
+
+        function beginSegmentRecording() {
+            isRecording = true;
+            audioChunks = [];
+            
+            // Update UI to show recording
+            startRecordingBtn.disabled = true;
+            stopRecordingBtn.disabled = false;
+            recordingStatus.style.display = 'inline-block';
+            updateStatus('Recording segment...', 'info');
+            
+            // Start segment timer
+            segmentTime = 0;
+            segmentTimerEl.textContent = '0s';
+            segmentTimer = setInterval(() => {
+                segmentTime++;
+                segmentTimerEl.textContent = segmentTime + 's';
+            }, 1000);
+            
+            // Create a new MediaRecorder for this segment
+            mediaRecorder = new MediaRecorder(window.audioStream, { 
+                mimeType: 'audio/webm; codecs=opus',
+                audioBitsPerSecond: 128000
+            });
+            
+            // Collect the audio chunks
+            mediaRecorder.addEventListener('dataavailable', event => {
+                if (event.data.size > 0) {
+                    audioChunks.push(event.data);
+                }
+            });
+            
+            // When this segment ends, process it
+            mediaRecorder.addEventListener('stop', () => {
+                // Clear segment timer
+                clearInterval(segmentTimer);
+                
+                // Process the collected chunks
+                if (audioChunks.length > 0) {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    
+                    // Send the audio data to the server
+                    if (socket.connected) {
+                        console.log("Sending audio chunk to server, size:", audioBlob.size);
+                        // For debugging - log size of each chunk
+                        updateStatus(`Sending ${(audioBlob.size / 1024).toFixed(1)}KB audio chunk...`, 'info');
+                        
+                        // Convert blob to array buffer for sending
+                        const reader = new FileReader();
+                        reader.onload = function() {
+                            const arrayBuffer = this.result;
+                            socket.emit('audio_data', { audio: arrayBuffer });
+                        };
+                        reader.readAsArrayBuffer(audioBlob);
+                    } else {
+                        console.error("Socket not connected, can't send audio");
+                        updateStatus('Connection error. Cannot send audio.', 'error');
+                    }
+                }
+                
+                // Start next segment or cleanup
+                if (isRecording) {
+                    // Start the next segment immediately
+                    beginNextSegment();
+                } else {
+                    // Update UI for stopped state
+                    recordingStatus.style.display = 'none';
+                    updateStatus('Recording stopped.', 'info');
+                }
+            });
+            
+            // Start recording this segment
+            mediaRecorder.start();
+            
+            // Stop this segment after 10 seconds
+            setTimeout(() => {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+            }, 10000);
+        }
+
+        function beginNextSegment() {
+            // Small delay before starting next segment to ensure clean transition
+            setTimeout(() => {
+                if (isRecording) {
+                    audioChunks = [];
+                    beginSegmentRecording();
+                }
+            }, 100);
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            
+            // Clear segment timer if running
+            if (segmentTimer) {
+                clearInterval(segmentTimer);
+            }
+            
+            // Stop the current recording if active
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+            }
+            
+            // Stop and release all tracks
+            if (window.audioStream) {
+                window.audioStream.getTracks().forEach(track => track.stop());
+                window.audioStream = null;
+            }
+            
+            // Update UI to show stopped state
+            recordingStatus.style.display = 'none';
+            updateStatus('Recording stopped.', 'info');
+            startRecordingBtn.disabled = false;
+            stopRecordingBtn.disabled = true;
+        }
+        
+        // UI Update Functions
+        function updateStatus(message, type = 'info') {
+            statusDiv.textContent = message;
+            statusDiv.className = `status-bar ${type}`;
+        }
+        
+        function addTranscriptionText(text) {
+            const p = document.createElement('p');
+            p.textContent = text;
+            transcriptionDisplay.appendChild(p);
+            transcriptionDisplay.scrollTop = transcriptionDisplay.scrollHeight;
+        }
+        
+        // Socket.IO Event Handlers
+        socket.on('connect', () => {
+            updateStatus('Connected to server. Ready.');
+            console.log('Socket.IO connected');
+        });
+        
+        socket.on('disconnect', () => {
+            updateStatus('Disconnected from server.', 'error');
+            console.log('Socket.IO disconnected');
+            
+            // Stop recording if active when disconnection occurs
+            if (isRecording) {
+                stopRecording();
+            }
+        });
+        
+        socket.on('connect_error', (err) => {
+            updateStatus(`Connection Error: ${err.message}`, 'error');
+            console.error('Socket.IO connection error:', err);
+            
+            // Stop recording if active when connection error occurs
+            if (isRecording) {
+                stopRecording();
+            }
+        });
+        
+        socket.on('update_graph', (data) => {
+            console.log("Received graph update:", data);
+            updateStatus('Graph updated.');
+            
+            if (data && Array.isArray(data.nodes) && Array.isArray(data.edges)) {
+                // Clear existing data
+                nodes.clear(); 
+                edges.clear();
+                
+                // Add new data
+                nodes.add(data.nodes);
+                edges.add(data.edges);
+                
+                // Fit the view
+                if (network) {
+                    network.fit({ animation: { duration: 300, easingFunction: 'linear' }});
+                }
+            } else {
+                console.error("Received invalid graph data format:", data);
+                updateStatus('Received invalid graph data.', 'error');
+            }
+        });
+        
+        socket.on('transcription', (data) => {
+            console.log("Received transcription:", data);
+            addTranscriptionText(data.text);
+        });
+        
+        socket.on('transcription_update', (data) => {
+            console.log("Received transcription update:", data);
+            addTranscriptionText(data.transcript);
+        });
+        
+        socket.on('query_response', (data) => {
+            console.log("Received query response:", data);
+            queryResult.textContent = data.response;
+        });
+        
+        socket.on('error', (data) => {
+            console.error("Server error:", data.message);
+            updateStatus(`Error: ${data.message}`, 'error');
+        });
+        
+        socket.on('info', (data) => {
+            console.info("Server info:", data.message);
+            updateStatus(data.message, 'info');
+        });
+        
+        socket.on('config_updated', (data) => {
+            console.info("Configuration updated:", data);
+            sentenceChunksInput.value = data.sentence_size;
+            slowChunksInput.value = data.slow_size;
+            updateStatus('Configuration updated.');
+        });
+        
+        // Event Listeners
+        startRecordingBtn.addEventListener('click', startRecording);
+        stopRecordingBtn.addEventListener('click', stopRecording);
+        
+        textInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const text = textInput.value.trim();
+                if (text) {
+                    socket.emit('text_input', { text });
+                    textInput.value = '';
+                }
+            }
+        });
+        
+        submitQueryBtn.addEventListener('click', () => {
+            const query = queryInput.value.trim();
+            if (query) {
+                queryResult.textContent = 'Processing query...';
+                socket.emit('query', { query });
+            }
+        });
+        
+        queryInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                submitQueryBtn.click();
+            }
+        });
+        
+        updateSettingsBtn.addEventListener('click', () => {
+            const sentenceSize = parseInt(sentenceChunksInput.value);
+            const slowSize = parseInt(slowChunksInput.value);
+            
+            if (sentenceSize > 0 && slowSize > 0) {
+                socket.emit('set_chunk_size', {
+                    sentence_size: sentenceSize,
+                    slow_size: slowSize
+                });
+            } else {
+                updateStatus('Invalid chunk sizes. Must be greater than 0.', 'error');
+            }
+        });
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeGraph();
+            updateStatus('Ready. Press "Start Recording" to begin.');
+        });
+    </script>
+</body>
+</html>
