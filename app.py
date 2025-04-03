@@ -284,133 +284,118 @@ def extract_label(uri_or_literal):
         return str(uri_or_literal)
 
 def graph_to_visjs(graph):
-    """Converts an rdflib Graph to Vis.js nodes and edges format."""
-    nodes = []
+    """Converts an rdflib Graph to Vis.js nodes and edges format, focusing on instances."""
+    nodes_data = {} # Use dict for easier node property updates: {uri_str: node_dict}
     edges = []
-    node_ids = set()  # Keep track of added node URIs/IDs to avoid duplicates
+    instance_uris = set() # URIs identified as instances to be visualized as nodes
 
-    # Define schema URIs to potentially filter out or style differently in visualization
-    # These are typically less interesting to see as explicit nodes in the main graph view
-    schema_node_uris = {
-        RDF.type, RDFS.Class, OWL.Class, OWL.ObjectProperty, OWL.Thing, RDFS.Resource,
-        OWL.DatatypeProperty, RDFS.subClassOf, RDFS.Literal, RDFS.domain, RDFS.range,
-        XSD.string, XSD.integer, XSD.boolean, XSD.date, XSD.dateTime # Common datatypes
-    }
+    # --- Define URIs/Prefixes to generally ignore for direct visualization ---
+    # Schema properties often define structure rather than instance relations
+    schema_properties_to_ignore = {RDF.type, RDFS.subClassOf, RDFS.domain, RDFS.range, OWL.inverseOf, OWL.equivalentClass, OWL.equivalentProperty}
+    # Schema classes/types we usually don't want as standalone nodes
+    schema_classes_to_ignore = {OWL.Class, RDFS.Class, RDF.Property, OWL.ObjectProperty, OWL.DatatypeProperty, RDFS.Resource, OWL.Thing}
+    # Prefixes to ignore
     schema_prefixes = (str(RDF), str(RDFS), str(OWL), str(XSD))
 
-    # Iterate through all triples in the graph
+    # --- Pass 1: Identify instance URIs ---
     for s, p, o in graph:
-        subject_str = str(s)
-        predicate_str = str(p)
-        object_str = str(o)
+        s_str, p_str, o_str = str(s), str(p), str(o)
 
-        # --- Add Nodes ---
-        # Add subject node if it's a URI, not already added, and not a schema URI/prefix
-        if isinstance(s, URIRef) and subject_str not in node_ids and s not in schema_node_uris and not subject_str.startswith(schema_prefixes):
-            nodes.append({
-                "id": subject_str,
-                "label": extract_label(s), # Initial label from URI
-                "title": f"URI: {subject_str}\n" # Tooltip starts with URI, add newline
-            })
-            node_ids.add(subject_str)
+        # If it's a type definition, the subject is likely an instance
+        if p == RDF.type and isinstance(s, URIRef) and isinstance(o, URIRef) and \
+           o not in schema_classes_to_ignore and not s_str.startswith(schema_prefixes) and \
+           not o_str.startswith(schema_prefixes):
+            instance_uris.add(s_str)
 
-        # Add object node if it's a URI, not already added, and not a schema URI/prefix
-        if isinstance(o, URIRef) and object_str not in node_ids and o not in schema_node_uris and not object_str.startswith(schema_prefixes):
-             nodes.append({
-                 "id": object_str,
-                 "label": extract_label(o), # Initial label from URI
-                 "title": f"URI: {object_str}\n" # Tooltip starts with URI
-             })
-             node_ids.add(object_str)
+        # If it connects two URIs via a non-schema property, both might be instances
+        elif isinstance(s, URIRef) and isinstance(o, URIRef) and \
+             p not in schema_properties_to_ignore and \
+             not s_str.startswith(schema_prefixes) and \
+             not o_str.startswith(schema_prefixes) and \
+             not p_str.startswith(schema_prefixes):
+            instance_uris.add(s_str)
+            instance_uris.add(o_str)
 
-        # --- Add Edges and Properties to Nodes ---
-        # If subject is a visualized node...
-        if subject_str in node_ids:
-            # Case 1: Object is a URI (relationship edge or rdf:type)
-            if isinstance(o, URIRef):
-                # If the object is also a visualized node...
-                if object_str in node_ids:
-                    # Add a relationship edge (excluding specific schema predicates like type/subClass)
-                    if p not in {RDF.type, RDFS.subClassOf, RDFS.domain, RDFS.range}:
-                        edges.append({
-                            "from": subject_str,
-                            "to": object_str,
-                            "label": extract_label(p),
-                            "title": f"Predicate: {extract_label(p)}", # Tooltip for edge
-                            "arrows": "to"
-                        })
-                    # Handle rdf:type separately to add info to node label/title
-                    elif p == RDF.type and o not in schema_node_uris and not object_str.startswith(schema_prefixes):
-                         # Add type information to the subject node's tooltip and maybe label
-                         for node in nodes:
-                             if node["id"] == subject_str:
-                                 type_label = extract_label(o)
-                                 # Add to title (tooltip)
-                                 node['title'] += f"Type: {type_label}\n"
-                                 # Optionally append type to label for clarity, avoid duplication
-                                 type_suffix = f" ({type_label})"
-                                 if type_suffix not in node['label'] and node['label'] != type_label:
-                                      node['label'] += type_suffix
-                                 break
-                # Else (object is a URI but not visualized, e.g., a schema class):
-                # Optionally add this info to the subject node's title
-                elif p == RDF.type: # e.g., node rdf:type RDFS.Class
-                     for node in nodes:
-                         if node["id"] == subject_str:
-                              node['title'] += f"Schema Type: {extract_label(o)}\n"
-                              break
+        # If it assigns a literal property (like label, name, or other data), the subject is an instance
+        elif isinstance(s, URIRef) and isinstance(o, Literal) and \
+             not s_str.startswith(schema_prefixes) and \
+             not p_str.startswith(schema_prefixes):
+             # Add subject even if predicate is rdfs:label etc. here
+             instance_uris.add(s_str)
 
-            # Case 2: Object is a Literal (property)
+    # --- Pass 2: Create nodes for identified instances ---
+    for uri in instance_uris:
+        # Check again to ensure it's not an explicitly ignored schema class/type URI
+        # This handles cases where a schema URI might have accidentally been added
+        # e.g. if RDFS.Class was subject of some triple by mistake in the graph data
+        if URIRef(uri) not in schema_classes_to_ignore and not uri.startswith(schema_prefixes):
+             nodes_data[uri] = {
+                "id": uri,
+                "label": extract_label(URIRef(uri)), # Initial label from URI fragment/qname
+                "title": f"URI: {uri}\n", # Tooltip starts with URI
+                "group": "Instance" # Default group, can be overridden by type
+            }
+
+    # --- Pass 3: Add edges and properties to the created instance nodes ---
+    for s, p, o in graph:
+        s_str, p_str, o_str = str(s), str(p), str(o)
+
+        # Process only if the subject is a visualized instance node
+        if s_str in nodes_data:
+            node = nodes_data[s_str] # Get the node dict to update
+
+            # Case 1: Relationship edge to another visualized instance node
+            if o_str in nodes_data and isinstance(o, URIRef) and \
+               p not in schema_properties_to_ignore and \
+               not p_str.startswith(schema_prefixes):
+                 edges.append({
+                    "from": s_str,
+                    "to": o_str,
+                    "label": extract_label(p),
+                    "title": f"Predicate: {extract_label(p)}", # Tooltip for edge
+                    "arrows": "to"
+                })
+
+            # Case 2: Type definition (add info to node, don't create edge/node for class)
+            elif p == RDF.type and isinstance(o, URIRef) and \
+                 o not in schema_classes_to_ignore and not o_str.startswith(schema_prefixes):
+                type_label = extract_label(o)
+                # Add type info to tooltip
+                node['title'] += f"Type: {type_label}\n"
+                # Add type to label for clarity, avoid repeating if label is already the type
+                type_suffix = f" ({type_label})"
+                if type_suffix not in node['label'] and node['label'] != type_label:
+                    node['label'] += type_suffix
+                # Assign Vis.js group based on type for potential styling
+                node['group'] = type_label
+
+            # Case 3: Literal property assignment (add info to node tooltip/label)
             elif isinstance(o, Literal):
-                # Add literal value as property to the subject node's title (tooltip)
-                for node in nodes:
-                    if node["id"] == subject_str:
-                        prop_label = extract_label(p)
-                        lit_label = extract_label(o)
-                        # Append property to tooltip
-                        node['title'] += f"{prop_label}: {lit_label}\n"
-                        # Special handling for labels: Use rdfs:label as the primary node label
-                        if p == RDFS.label:
-                            node['label'] = lit_label # Overwrite default URI label
-                        # You could add similar logic for 'name' or other primary display properties
-                        elif predicate_str.endswith("Name") or predicate_str.endswith("name"):
-                             if node['label'] == extract_label(s): # Only overwrite if label is still default
-                                 node['label'] = lit_label
-                        break
+                prop_label = extract_label(p)
+                lit_label = extract_label(o)
+                # Add property to tooltip
+                node['title'] += f"{prop_label}: {lit_label}\n"
+                # Special handling for rdfs:label - use it as the primary node label
+                if p == RDFS.label:
+                    node['label'] = lit_label # Overwrite default URI-based label
 
-    # --- Add Hierarchy Edges ---
-    # Add rdfs:subClassOf as distinct hierarchical edges
-    for s, p, o in graph.triples((None, RDFS.subClassOf, None)):
-        subject_str = str(s)
-        object_str = str(o)
-        # Only add edge if both subject and object are visualized nodes
-        if subject_str in node_ids and object_str in node_ids:
-            edges.append({
-                "from": subject_str,
-                "to": object_str,
-                "label": "subClassOf",
-                "arrows": "to",
-                "color": {"color": "#AAAAAA", "highlight": "#777777"}, # Style differently
-                "dashes": True, # Use dashed lines for hierarchy
-                "title": "rdfs:subClassOf"
-            })
+    # Clean up tooltips (remove trailing newline)
+    final_nodes = []
+    for node in nodes_data.values():
+        node['title'] = node['title'].strip()
+        final_nodes.append(node)
 
-    # --- Deduplicate Edges ---
-    # Prevents visual clutter if the same relationship is asserted multiple times
+    # Deduplicate edges (simple check based on from, to, label)
     unique_edges_set = set()
     unique_edges = []
     for edge in edges:
-        # Create a tuple key: (from_node, to_node, edge_label)
         edge_key = (edge['from'], edge['to'], edge.get('label'))
         if edge_key not in unique_edges_set:
             unique_edges.append(edge)
             unique_edges_set.add(edge_key)
 
-    # Final cleanup on node titles (remove trailing newline)
-    for node in nodes:
-        node['title'] = node['title'].strip()
-
-    return {"nodes": nodes, "edges": unique_edges}
+    # Return the filtered nodes and edges
+    return {"nodes": final_nodes, "edges": unique_edges}
 
 def process_turtle_data(turtle_data, sid):
     """Process Turtle data string, add new triples to the shared accumulated_graph."""
