@@ -1,9 +1,13 @@
+# Server requirements
 flask>=2.0.0
 flask-socketio>=5.2.0
 eventlet>=0.33.3
 python-dotenv>=0.20.0
-google-generativeai>=0.3.0
+google-genai
 rdflib>=6.2.0
-faster-whisper>=0.9.0
-ffmpeg-python>=0.2.0
 numpy>=1.22.0
+nltk>=3.7
+
+# CLI client requirements
+pyaudio>=0.2.13
+websocket-client>=1.4.0

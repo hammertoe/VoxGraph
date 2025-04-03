@@ -255,7 +255,7 @@ accumulated_graph.bind("xsd", XSD)
 accumulated_graph.bind("ex", EX)
 
 # Config for chunk sizes and timeouts (can be global or potentially adjusted per client later)
-SENTENCE_CHUNK_SIZE = 3  # Number of sentences to collect before quick LLM processing
+SENTENCE_CHUNK_SIZE = 1  # Number of sentences to collect before quick LLM processing
 SLOW_LLM_CHUNK_SIZE = 5  # Number of quick LLM results to collect before slow LLM processing
 FAST_LLM_TIMEOUT = 20  # Seconds to wait before flushing sentence buffer to fast LLM
 SLOW_LLM_TIMEOUT = 60  # Seconds to wait before flushing quick LLM results to slow LLM
