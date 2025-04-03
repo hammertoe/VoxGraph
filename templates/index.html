@@ -8,115 +8,129 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         html, body {
-            height: 100%; /* Ensure html and body take full viewport height */
+            height: 100%;
             margin: 0;
             padding: 0;
-            overflow: hidden; /* Prevent scrollbars on body if content fits */
+            overflow: hidden;
         }
 
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #f8f9fa;
             display: flex;
-            flex-direction: column; /* Stack elements vertically */
+            flex-direction: column;
         }
 
         .navbar {
             background-color: #343a40;
-            /* color: white;  Removed, set on brand directly */
             padding: 0.5rem 1rem;
-            flex-shrink: 0; /* Prevent navbar from shrinking */
-            z-index: 10; /* Keep navbar above other content if overlap occurs */
+            flex-shrink: 0;
+            z-index: 10;
         }
 
-        /* Ensure navbar brand text is white */
         .navbar .navbar-brand {
-             color: white !important; /* Force white color */
+             color: white !important;
         }
-
 
         .main-content-area {
             padding: 20px;
-            flex-grow: 1; /* Allow this area to take up remaining vertical space */
+            flex-grow: 1;
             display: flex;
             flex-direction: column;
-            overflow-y: auto; /* Allow scrolling within this area if needed, not on body */
-            min-height: 0; /* Important for flex-grow in column layout */
+            overflow: hidden; /* Hide overflow for the main area */
+            min-height: 0;
+        }
+
+        /* The row containing graph and query */
+        .content-row {
+            flex-grow: 1; /* Allow row to take vertical space */
+            min-height: 0; /* Important for children height % */
+            display: flex; /* Use flex for row content */
+        }
+
+        /* Columns within the row */
+        .graph-column {
+             /* Use Bootstrap's col-md-8 */
+             height: 100%; /* Fill the row height */
+             display: flex; /* Make it a flex container */
+             flex-direction: column; /* Stack elements inside if needed */
+        }
+        .query-column {
+            /* Use Bootstrap's col-md-4 */
+            height: 100%; /* Fill the row height */
+            display: flex; /* Make it a flex container */
+            flex-direction: column; /* Stack card elements inside */
+            padding-left: 15px; /* Add some space between columns */
         }
 
         #graph-container {
             width: 100%;
-            flex-grow: 1; /* Allow graph container to expand vertically */
-            min-height: 400px; /* Maintain a reasonable minimum height */
+            height: 100%; /* Fill parent column (.graph-column) */
             border: 1px solid #dee2e6;
             border-radius: 4px;
             background-color: white;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            margin-bottom: 20px; /* Space below graph */
         }
 
         .query-section {
-            flex-shrink: 0; /* Prevent query section from shrinking */
-            margin-bottom: 15px; /* Space below query section */
+             /* Let the card fill the query column */
+             display: flex;
+             flex-direction: column;
+             height: 100%; /* Fill the column */
+             overflow: hidden; /* Prevent card content from overflowing column */
         }
 
-        .card {
+        .query-section .card {
+            flex-grow: 1; /* Allow card to grow */
+            display: flex;
+            flex-direction: column;
             border-radius: 4px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
 
-        .card-header {
+        .query-section .card-header {
             background-color: #f1f3f5;
             font-weight: bold;
+            flex-shrink: 0; /* Prevent header shrinking */
         }
 
-        .btn-primary {
-            background-color: #0d6efd;
-            border-color: #0d6efd;
+        .query-section .card-body {
+            flex-grow: 1; /* Allow body to take space */
+            overflow-y: auto; /* Allow scrolling within card body */
+            display: flex;
+            flex-direction: column;
         }
 
         #query-result {
-            min-height: 60px; /* Slightly reduced min-height */
-            max-height: 150px; /* Add max-height to prevent excessive growth */
-            overflow-y: auto; /* Allow scrolling for long answers */
+            min-height: 60px;
+            /* Removed max-height to let it grow within card-body */
             border: 1px solid #dee2e6;
             padding: 10px;
             background-color: white;
             border-radius: 4px;
             margin-top: 10px;
             white-space: pre-wrap;
+            flex-grow: 1; /* Allow result area to expand */
+            overflow-y: auto; /* Scroll specifically within results */
         }
 
         .status-bar {
             padding: 10px;
             border-radius: 4px;
-            flex-shrink: 0; /* Prevent status bar from shrinking */
-            margin-top: auto; /* Push status bar towards the bottom within main-content-area */
-            position: sticky; /* Keep status bar potentially visible */
-            bottom: 0;      /* Stick to bottom if scrolling */
-            background-color: #f8f9fa; /* Match body background */
-            z-index: 5; /* Keep above graph if overlapping */
+            flex-shrink: 0;
+            margin-top: 15px; /* Space above status bar */
+            /* Removed sticky positioning */
         }
 
         .info {
-            background-color: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #bee5eb; /* Add border for definition */
+            background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb;
         }
-
         .error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb; /* Add border for definition */
+            background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;
         }
-
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        .form-control {
-            border-radius: 4px;
-        }
+        .form-group { margin-bottom: 15px; }
+        .form-control { border-radius: 4px; }
+        .btn-primary { background-color: #0d6efd; border-color: #0d6efd; }
 
     </style>
 </head>
@@ -127,33 +141,41 @@
         </div>
     </nav>
 
-    <!-- Wrap main content to manage flex growth and scrolling -->
     <div class="main-content-area">
-        <!-- Graph Visualization -->
-        <div id="graph-container"></div>
+        <!-- Row containing graph and query columns -->
+        <div class="row content-row gx-3"> <!-- gx-3 adds horizontal gutter -->
 
-        <!-- Query Panel -->
-        <div class="query-section card">
-            <div class="card-header">Query the Knowledge Graph</div>
-            <div class="card-body">
-                <div class="form-group">
-                    <input type="text" id="query-input" class="form-control" placeholder="Ask a question about the knowledge graph...">
-                </div>
-                <button id="submit-query" class="btn btn-primary">Submit Query</button>
-                <div id="query-result">Waiting for query...</div>
+            <!-- Graph Column (Larger) -->
+            <div class="col-md-9 graph-column">
+                <div id="graph-container"></div>
             </div>
-        </div>
 
-        <!-- Status Bar -->
+            <!-- Query Column (Smaller) -->
+            <div class="col-md-3 query-column">
+                <div class="query-section card">
+                    <div class="card-header">Query the Knowledge Graph</div>
+                    <div class="card-body">
+                        <div class="form-group flex-shrink-0"> <!-- Prevent input group shrinking -->
+                            <input type="text" id="query-input" class="form-control" placeholder="Ask a question...">
+                            <button id="submit-query" class="btn btn-primary mt-2">Submit Query</button>
+                        </div>
+                        <div id="query-result" class="mt-2">Waiting for query...</div>
+                    </div>
+                </div>
+            </div>
+
+        </div> <!-- End content-row -->
+
+        <!-- Status Bar below the row -->
         <div id="status" class="status-bar info">Initializing...</div>
-    </div> <!-- End main-content-area -->
 
+    </div> <!-- End main-content-area -->
 
     <!-- Socket.IO Client Library -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
     <!-- Vis.js Network Library -->
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-    <!-- Main JavaScript -->
+    <!-- Main JavaScript (No changes needed from previous version) -->
     <script type="text/javascript">
         // Global variables
         const socket = io(); // Connect to Socket.IO server
@@ -172,104 +194,67 @@
         function initializeGraph() {
             const data = { nodes: nodes, edges: edges };
             const options = {
-                // Vis.js options remain largely the same
-                layout: {}, // Use default physics layout initially
-                nodes: {
-                    shape: 'box',
-                    font: { size: 14, face: 'arial' },
-                    borderWidth: 1,
-                    shapeProperties: { borderRadius: 3 },
-                    margin: 10
-                },
-                edges: {
-                    arrows: { to: { enabled: true, scaleFactor: 0.7 } },
-                    font: { size: 12, align: 'middle' },
-                    color: { inherit: false, color: '#848484', highlight:'#848484', hover: '#848484', opacity:1.0 },
-                    smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 }
-                },
-                physics: {
-                    enabled: true,
-                    solver: 'barnesHut',
-                    barnesHut: { gravitationalConstant: -4000, centralGravity: 0.15, springLength: 130, springConstant: 0.06, damping: 0.15 },
-                    stabilization: { iterations: 150 }
-                },
-                interaction: {
-                    tooltipDelay: 200,
-                    hover: true,
-                    zoomView: true,
-                    dragView: true
-                }
+                layout: {},
+                nodes: { shape: 'box', font: { size: 14, face: 'arial' }, borderWidth: 1, shapeProperties: { borderRadius: 3 }, margin: 10 },
+                edges: { arrows: { to: { enabled: true, scaleFactor: 0.7 } }, font: { size: 12, align: 'middle' }, color: { inherit: false, color: '#848484', highlight:'#848484', hover: '#848484', opacity:1.0 }, smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 } },
+                physics: { enabled: true, solver: 'barnesHut', barnesHut: { gravitationalConstant: -4000, centralGravity: 0.15, springLength: 130, springConstant: 0.06, damping: 0.15 }, stabilization: { iterations: 150 } },
+                interaction: { tooltipDelay: 200, hover: true, zoomView: true, dragView: true }
             };
             network = new vis.Network(graphContainer, data, options);
 
             network.on("stabilizationIterationsDone", function () {
                  console.log("Graph stabilization complete.");
-                 // Maybe fit after initial load / stabilization
                  network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' }});
             });
 
-            network.on("click", function (params) {
-                console.log('Graph element clicked:', params);
-            });
+            network.on("click", function (params) { console.log('Graph element clicked:', params); });
 
-            // Ensure graph resizes when container resizes
-             window.addEventListener('resize', () => {
-                 if (network) {
-                     network.redraw(); // Redraw the network
-                     network.fit();    // Optional: refit after redraw
-                 }
-             });
+            // Resize handler
+            let resizeTimer;
+            window.addEventListener('resize', () => {
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => {
+                     if (network) {
+                        console.log("Resizing graph...");
+                        network.redraw(); // Redraw first
+                        network.fit(); // Then fit
+                    }
+                }, 250); // Debounce resize event
+            });
         }
 
         // UI Update Functions
         function updateStatus(message, type = 'info') {
             statusDiv.textContent = message;
-            statusDiv.className = `status-bar ${type}`; // Make sure class includes 'status-bar'
+            statusDiv.className = `status-bar ${type}`; // Ensure class includes 'status-bar'
         }
 
         // Socket.IO Event Handlers
-        socket.on('connect', () => {
-            updateStatus('Connected to server. Ready.');
-            console.log('Socket.IO connected');
-        });
-
-        socket.on('disconnect', () => {
-            updateStatus('Disconnected from server.', 'error');
-            console.log('Socket.IO disconnected');
-        });
-
-        socket.on('connect_error', (err) => {
-            updateStatus(`Connection Error: ${err.message}`, 'error');
-            console.error('Socket.IO connection error:', err);
-        });
+        socket.on('connect', () => { updateStatus('Connected to server. Ready.'); console.log('Socket.IO connected'); });
+        socket.on('disconnect', () => { updateStatus('Disconnected from server.', 'error'); console.log('Socket.IO disconnected'); });
+        socket.on('connect_error', (err) => { updateStatus(`Connection Error: ${err.message}`, 'error'); console.error('Socket.IO connection error:', err); });
 
         socket.on('update_graph', (data) => {
             console.log("Received graph update:", data);
-
             if (data && Array.isArray(data.nodes) && Array.isArray(data.edges)) {
                 updateStatus(`Graph updated: ${data.nodes.length} nodes, ${data.edges.length} edges.`);
+                // Batch update/remove logic (more robust than simple update/clear)
+                const receivedNodeIds = new Set(data.nodes.map(n => n.id));
+                const receivedEdgeSignatures = new Set(data.edges.map(e => `${e.from}|${e.to}|${e.label || ''}`)); // Create unique signature
 
-                // Use batch processing for potentially better performance on large updates
-                let nodesToRemove = [];
-                nodes.getIds().forEach(id => {
-                    if (!data.nodes.find(n => n.id === id)) {
-                        nodesToRemove.push(id);
+                let nodesToRemove = nodes.getIds().filter(id => !receivedNodeIds.has(id));
+                let edgesToRemove = [];
+                edges.get().forEach(edge => {
+                    const signature = `${edge.from}|${edge.to}|${edge.label || ''}`;
+                    if (!receivedEdgeSignatures.has(signature)) {
+                        edgesToRemove.push(edge.id); // Assumes edges dataset uses internal IDs
                     }
                 });
 
-                let edgesToRemove = [];
-                edges.getIds().forEach(id => {
-                     const edge = edges.get(id);
-                     if (!data.edges.find(e => e.from === edge.from && e.to === edge.to && e.label === edge.label)) { // Assuming edges don't have stable IDs from server
-                         edgesToRemove.push(id);
-                     }
-                });
-
-                nodes.remove(nodesToRemove);
-                edges.remove(edgesToRemove);
-                nodes.update(data.nodes);
-                edges.update(data.edges);
-
+                if (nodesToRemove.length > 0) nodes.remove(nodesToRemove);
+                if (edgesToRemove.length > 0) edges.remove(edgesToRemove);
+                if (data.nodes.length > 0) nodes.update(data.nodes); // Use update to add/modify
+                if (data.edges.length > 0) edges.update(data.edges); // Use update to add/modify
 
             } else {
                 console.error("Received invalid graph data format:", data);
@@ -279,28 +264,18 @@
 
         socket.on('query_result', (data) => {
             console.log("Received query result:", data);
+            queryResult.textContent = data.answer; // Display answer directly
             if (data.error) {
-                queryResult.textContent = `Error: ${data.answer}`;
                 queryResult.style.color = 'red';
             } else if (data.processing) {
-                 queryResult.textContent = data.answer;
                  queryResult.style.color = 'grey';
-            }
-            else {
-                queryResult.textContent = data.answer;
+            } else {
                 queryResult.style.color = 'black';
             }
         });
 
-        socket.on('error', (data) => {
-            console.error("Server error:", data.message);
-            updateStatus(`Server Error: ${data.message}`, 'error');
-        });
-
-        socket.on('info', (data) => {
-            console.info("Server info:", data.message);
-            updateStatus(data.message, 'info');
-        });
+        socket.on('error', (data) => { console.error("Server error:", data.message); updateStatus(`Server Error: ${data.message}`, 'error'); });
+        socket.on('info', (data) => { console.info("Server info:", data.message); updateStatus(data.message, 'info'); });
 
         // Event Listeners
         submitQueryBtn.addEventListener('click', () => {
@@ -310,24 +285,17 @@
                 queryResult.style.color = 'grey';
                 console.log(`Emitting query_graph event with query: ${query}`);
                 socket.emit('query_graph', { query: query });
-                // queryInput.value = ''; // Keep query input for reference? Or clear it.
+                // queryInput.value = ''; // Decide whether to clear input
             } else {
                 queryResult.textContent = 'Please enter a query.';
                 queryResult.style.color = 'orange';
             }
         });
 
-        queryInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                submitQueryBtn.click();
-            }
-        });
+        queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { submitQueryBtn.click(); } });
 
         // Initialize on page load
-        document.addEventListener('DOMContentLoaded', () => {
-            initializeGraph();
-            updateStatus('Connecting to server...');
-        });
+        document.addEventListener('DOMContentLoaded', () => { initializeGraph(); updateStatus('Connecting to server...'); });
     </script>
 </body>
 </html>
