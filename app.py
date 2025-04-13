@@ -1,27 +1,34 @@
+# -*- coding: utf-8 -*-
 # Step 1: Import and enable eventlet monkey patching FIRST
 import eventlet
-eventlet.monkey_patch()
+# *** MODIFICATION: Tell eventlet NOT to patch the standard threading module ***
+eventlet.monkey_patch(thread=False) # Allows standard threading for asyncio isolation
 
 # Step 2: Now import all other modules
 import os
-import sys # Added for potential exit on missing API key
+import sys
 import logging
 import json
 import time
 import re
-from threading import Thread, Timer # Timer is used for timeouts
-# Removed Queue as state is managed per client in a dictionary
-import numpy as np # Keep if used elsewhere, otherwise can remove
+# *** Import standard threading and queue ***
+import threading
+from queue import Queue as ThreadSafeQueue, Empty as QueueEmpty, Full as QueueFull
+from threading import Timer # Keep for LLM timeouts
+import numpy as np # Keep if used elsewhere
+import io
+import asyncio
 
 # Step 3: Import Flask and related libraries
 from flask import Flask, render_template, request
-from flask_socketio import SocketIO, emit, join_room, leave_room # Added join/leave for potential future use
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 # Step 4: Import the rest of the dependencies
 # Google Gemini API imports
 from google import genai as genai
-from google.genai import types
-# `types` might not be needed if not directly using specific types from it
+from google.genai import types as genai_types
+from google.api_core import exceptions as google_exceptions
+
 # RDF handling imports
 from rdflib import Graph, URIRef, Literal
 from rdflib.namespace import RDF, RDFS, OWL, XSD
@@ -35,40 +42,52 @@ try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     # Download the punkt tokenizer data if not found
-    logger.info("NLTK 'punkt' tokenizer not found. Downloading...")
+    logging.info("NLTK 'punkt' tokenizer not found. Downloading...")
     nltk.download('punkt')
-    logger.info("NLTK 'punkt' tokenizer downloaded.")
+    logging.info("NLTK 'punkt' tokenizer downloaded.")
 from nltk.tokenize import sent_tokenize
 
 # --- Configuration & Setup ---
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
-# Configure logging
+# Configure logging - REMOVED [SID:%(sid)s] from global format
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# Add a filter to inject SID into log records if available
-class SidFilter(logging.Filter):
-    def filter(self, record):
-        # If request context is active and has a sid, add it
-        if request and hasattr(request, 'sid'):
-            record.sid = request.sid
-        else:
-            # Try to get sid from explicit arguments if passed (for background tasks)
-            # This requires passing sid explicitly to logging calls in background tasks
-            # or modifying the logger setup further. For now, default to 'N/A'.
-             record.sid = getattr(record, 'sid', 'N/A') # Get sid if passed, else N/A
-        return True
-
 logger = logging.getLogger(__name__)
-# logger.addFilter(SidFilter()) # Disabled for now, SID added manually in logs
+
+# --- Google AI Live API Specific Config ---
+# Use model name from env var or default matching client example
+GOOGLE_LIVE_API_MODEL = os.getenv("GOOGLE_LIVE_MODEL", "models/gemini-2.0-flash-exp")
+LIVE_API_SAMPLE_RATE = 16000
+LIVE_API_CHANNELS = 1
+LIVE_API_CONFIG = genai_types.GenerateContentConfig(
+    response_modalities=[genai_types.Modality.TEXT],
+    system_instruction=genai_types.Content(
+        parts=[
+            genai_types.Part(
+                text="""
+                    You are a transcription assistant.
+                    Transcribe the audio input accurately, preserving meaning.
+                    Format transcription as complete sentences when possible.
+                    Return ONLY the transcription text.
+                    """
+            )
+        ]
+    )
+)
 
 # Create Flask app and socketio
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)  # Secret key for session management
-# Ensure CORS allows connections from any origin (adjust if needed for security)
+app.config['SECRET_KEY'] = os.urandom(24)
 socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
 
-# --- Google Gemini LLM Setup ---
-# System prompts for the LLMs (Complete prompts included)
+# --- Google Gemini LLM & Live Client Setup ---
+client = None # For standard Chat models
+live_client = None # For Live API using v1alpha
+quick_chat = None
+slow_chat = None
+query_chat = None
+
+# --- System Prompts (Define BEFORE use) ---
 quick_llm_system_prompt = """
 You will convert transcribed speech into an RDF knowledge graph using Turtle syntax.
 Return only the new RDF Turtle triples representing entities and relationships mentioned in the text.
@@ -154,113 +173,88 @@ Based on the knowledge graph:
 Therefore, the graph indicates that Alice Johnson (`ex:AliceJohnson`) is leading Project Phoenix (`ex:ProjectPhoenix`).
 """
 
-# Initialize Gemini clients
-quick_chat = None
-slow_chat = None
-query_chat = None
-
 try:
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        # Using a dummy key locally might work for testing *without* actual LLM calls
-        # but will fail if calls are made. A real key is needed for functionality.
-        # api_key = "YOUR_API_KEY" # Replace with your actual key if needed temporarily
-        logger.critical("CRITICAL: GOOGLE_API_KEY environment variable not set. LLM features will likely fail.")
-        # Consider exiting if the key is essential:
-        # sys.exit("GOOGLE_API_KEY environment variable not set. Cannot initialize LLMs.")
-        client = genai.Client(api_key="dummy_key") # Configure with dummy to maybe allow app run
+        logger.critical("CRITICAL: GOOGLE_API_KEY environment variable not set. LLM/Live features will FAIL.")
     else:
         logger.info("Using GOOGLE_API_KEY from environment variable.")
-        client = genai.Client(api_key=api_key)
+        # Standard client for Chat models (if needed)
+        try:
+            client = genai.Client(api_key=api_key)
+            logger.info("Standard Google GenAI Client initialized.")
+        except Exception as e_std:
+            logger.error(f"Failed to initialize standard Google GenAI Client: {e_std}", exc_info=True)
+            client = None
 
-    # Set up generation config for quick model
-    quick_config = types.GenerateContentConfig(
-        temperature=0.1,
-        top_p=0.95,
-        top_k=40,
-        max_output_tokens=2048,
-        system_instruction=quick_llm_system_prompt
-    )
+        # Client for Live API using v1alpha (confirmed working pattern)
+        try:
+            live_client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
+            # Check if the expected async interface exists
+            _ = live_client.aio.live.connect # Check for the specific method used in client script
+            logger.info("Google GenAI Client initialized with v1alpha for Live API.")
+        except Exception as e_live:
+             logger.error(f"Failed to initialize Google GenAI client with v1alpha support ({e_live}). Live transcription will fail.", exc_info=True)
+             live_client = None
 
-    # Set up generation config for slow model
-    slow_config = types.GenerateContentConfig(
-        temperature=0.3,
-        top_p=0.95,
-        top_k=40,
-        max_output_tokens=4096, # Allow larger output for analysis
-        system_instruction=slow_llm_system_prompt
-    )
+        # Initialize Chat models only if standard client succeeded
+        if client:
+            # Correctly initialize GenerateContentConfig with keyword arguments
+            quick_config = genai_types.GenerateContentConfig(
+                temperature=0.1,
+                top_p=0.95,
+                top_k=40,
+                max_output_tokens=2048,
+                system_instruction=quick_llm_system_prompt # Use the defined variable
+            )
+            slow_config = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                top_p=0.95,
+                top_k=40,
+                max_output_tokens=4096,
+                system_instruction=slow_llm_system_prompt # Use the defined variable
+            )
+            query_config = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                top_p=0.95,
+                top_k=40,
+                max_output_tokens=2048,
+                system_instruction=query_llm_system_prompt # Use the defined variable
+            )
 
-    # Set up generation config for query model
-    query_config = types.GenerateContentConfig(
-        temperature=0.3, # Allow some flexibility for natural language answers
-        top_p=0.95,
-        top_k=40,
-        max_output_tokens=2048,
-        system_instruction=query_llm_system_prompt
-    )
+            # Get model names from environment or use defaults
+            quick_model_name = os.getenv("QUICK_LLM_MODEL", "gemini-2.0-flash")
+            slow_model_name = os.getenv("SLOW_LLM_MODEL", "gemini-2.5-pro-exp-03-25")
+            query_model_name = os.getenv("QUERY_LLM_MODEL", "gemini-1.5-pro")
 
-    # Create chat sessions - these maintain conversation history if needed,
-    # though for stateless processing per chunk/query, sending full context each time is also fine.
-    quick_model_name = "gemini-2.0-flash"
-    quick_chat = client.chats.create(
-        model=quick_model_name,
-        config=quick_config,
-    )
-    slow_model_name = "gemini-2.5-pro-exp-03-25"
-    slow_chat = client.chats.create(
-        model=slow_model_name,
-        config=slow_config,
-    )
-    query_model_name = "gemini-1.5-pro"
-    query_chat = client.chats.create(
-        model=query_model_name,
-        config=query_config,
-    )
-
-
-    logger.info(f"LLM models initialized - Quick: {quick_model_name}, Slow: {slow_model_name}, Query: {query_model_name}")
+            # Create chat sessions
+            quick_chat = client.chats.create(model=quick_model_name, config=quick_config)
+            slow_chat = client.chats.create(model=slow_model_name, config=slow_config)
+            query_chat = client.chats.create(model=query_model_name, config=query_config)
+            logger.info(f"LLM Chat models initialized - Quick: {quick_model_name}, Slow: {slow_model_name}, Query: {query_model_name}")
+        else:
+            logger.warning("Chat models not initialized due to standard client failure.")
 
 except Exception as e:
-    logger.error(f"Error initializing Google Gemini clients: {e}", exc_info=True)
-    # Set chats to None so checks later will prevent errors
-    quick_chat = None
-    slow_chat = None
-    query_chat = None
-    logger.warning("Proceeding without full LLM functionality.")
+    logger.error(f"General error during Google Gemini client initialization: {e}", exc_info=True)
+    client = live_client = quick_chat = slow_chat = query_chat = None
+    logger.warning("Proceeding with potentially limited LLM/Live functionality.")
+
 
 # --- Global State Management ---
-# Dictionary to store state for each connected client (identified by session ID)
-# Each client gets their own buffers and timers.
 client_buffers = {}
-# Example structure:
-# client_buffers = {
-#     'client_sid_1': {
-#         'sentence_buffer': ['Sentence 1.', 'Sentence 2.'],
-#         'quick_llm_results': ['<...> rdf data ...', '<...> more rdf ...'],
-#         'fast_llm_timer': <Timer object or None>,
-#         'slow_llm_timer': <Timer object or None>
-#     },
-#     'client_sid_2': { ... }
-# }
-
-# The RDF graph is shared across all clients. Modifications from any client update this single graph.
+# Structure includes audio_queue, status_queue, and live_session_thread
+# client_buffers = { 'sid': { 'sentence_buffer': [], 'quick_llm_results': [], 'fast_llm_timer': None, 'slow_llm_timer': None,
+#                            'audio_queue': ThreadSafeQueue, 'status_queue': ThreadSafeQueue, 'live_session_thread': threading.Thread,
+#                            'is_receiving_audio': False, 'live_session_object': <Google Live Session Object>,
+#                            'status_poller_task': <GreenThread> } }
 accumulated_graph = Graph()
-# Define common namespaces and bind them
 EX = URIRef("http://example.org/")
-accumulated_graph.bind("rdf", RDF)
-accumulated_graph.bind("rdfs", RDFS)
-accumulated_graph.bind("owl", OWL)
-accumulated_graph.bind("xsd", XSD)
-accumulated_graph.bind("ex", EX)
-
-# Config for chunk sizes and timeouts (can be global or potentially adjusted per client later)
-SENTENCE_CHUNK_SIZE = 1  # Number of sentences to collect before quick LLM processing
-SLOW_LLM_CHUNK_SIZE = 5  # Number of quick LLM results to collect before slow LLM processing
-FAST_LLM_TIMEOUT = 20  # Seconds to wait before flushing sentence buffer to fast LLM
-SLOW_LLM_TIMEOUT = 60  # Seconds to wait before flushing quick LLM results to slow LLM
-
-# Global timers are removed, they are now managed per client in client_buffers
+accumulated_graph.bind("rdf", RDF); accumulated_graph.bind("rdfs", RDFS); accumulated_graph.bind("owl", OWL); accumulated_graph.bind("xsd", XSD); accumulated_graph.bind("ex", EX)
+SENTENCE_CHUNK_SIZE = 1
+SLOW_LLM_CHUNK_SIZE = 5
+FAST_LLM_TIMEOUT = 20
+SLOW_LLM_TIMEOUT = 60
 
 # --- Helper Functions ---
 
@@ -268,19 +262,13 @@ def extract_label(uri_or_literal):
     """Helper to get a readable label from URI or Literal for display."""
     if isinstance(uri_or_literal, URIRef):
         try:
-            # Try to compute a QName (prefix:localname) if prefix is bound
             prefix, namespace, name = accumulated_graph.compute_qname(uri_or_literal, generate=False)
-            return f"{prefix}:{name}" if prefix else name # Return qname or just local name
+            return f"{prefix}:{name}" if prefix else name
         except:
-            # Fallback: Split by the last '#' or '/'
-            if '#' in uri_or_literal:
-                return uri_or_literal.split('#')[-1]
-            return uri_or_literal.split('/')[-1]
+            return uri_or_literal.split('#')[-1] if '#' in uri_or_literal else uri_or_literal.split('/')[-1]
     elif isinstance(uri_or_literal, Literal):
-        # Just return the string value of the literal
         return str(uri_or_literal)
     else:
-        # Fallback for other types
         return str(uri_or_literal)
 
 def graph_to_visjs(graph):
@@ -288,713 +276,558 @@ def graph_to_visjs(graph):
     nodes_data = {} # Use dict for easier node property updates: {uri_str: node_dict}
     edges = []
     instance_uris = set() # URIs identified as instances to be visualized as nodes
-
-    # --- Define URIs/Prefixes to generally ignore for direct visualization ---
-    # Schema properties often define structure rather than instance relations
     schema_properties_to_ignore = {RDF.type, RDFS.subClassOf, RDFS.domain, RDFS.range, OWL.inverseOf, OWL.equivalentClass, OWL.equivalentProperty}
-    # Schema classes/types we usually don't want as standalone nodes
     schema_classes_to_ignore = {OWL.Class, RDFS.Class, RDF.Property, OWL.ObjectProperty, OWL.DatatypeProperty, RDFS.Resource, OWL.Thing}
-    # Prefixes to ignore
     schema_prefixes = (str(RDF), str(RDFS), str(OWL), str(XSD))
 
-    # --- Pass 1: Identify instance URIs ---
-    for s, p, o in graph:
+    for s, p, o in graph: # Pass 1: Identify instance URIs
         s_str, p_str, o_str = str(s), str(p), str(o)
+        if p == RDF.type and isinstance(s, URIRef) and isinstance(o, URIRef) and o not in schema_classes_to_ignore and not s_str.startswith(schema_prefixes) and not o_str.startswith(schema_prefixes): instance_uris.add(s_str)
+        elif isinstance(s, URIRef) and isinstance(o, URIRef) and p not in schema_properties_to_ignore and not s_str.startswith(schema_prefixes) and not o_str.startswith(schema_prefixes) and not p_str.startswith(schema_prefixes): instance_uris.add(s_str); instance_uris.add(o_str)
+        elif isinstance(s, URIRef) and isinstance(o, Literal) and not s_str.startswith(schema_prefixes) and not p_str.startswith(schema_prefixes): instance_uris.add(s_str)
 
-        # If it's a type definition, the subject is likely an instance
-        if p == RDF.type and isinstance(s, URIRef) and isinstance(o, URIRef) and \
-           o not in schema_classes_to_ignore and not s_str.startswith(schema_prefixes) and \
-           not o_str.startswith(schema_prefixes):
-            instance_uris.add(s_str)
+    for uri in instance_uris: # Pass 2: Create nodes for identified instances
+        if URIRef(uri) not in schema_classes_to_ignore and not uri.startswith(schema_prefixes): nodes_data[uri] = {"id": uri, "label": extract_label(URIRef(uri)), "title": f"URI: {uri}\n", "group": "Instance"}
 
-        # If it connects two URIs via a non-schema property, both might be instances
-        elif isinstance(s, URIRef) and isinstance(o, URIRef) and \
-             p not in schema_properties_to_ignore and \
-             not s_str.startswith(schema_prefixes) and \
-             not o_str.startswith(schema_prefixes) and \
-             not p_str.startswith(schema_prefixes):
-            instance_uris.add(s_str)
-            instance_uris.add(o_str)
-
-        # If it assigns a literal property (like label, name, or other data), the subject is an instance
-        elif isinstance(s, URIRef) and isinstance(o, Literal) and \
-             not s_str.startswith(schema_prefixes) and \
-             not p_str.startswith(schema_prefixes):
-             # Add subject even if predicate is rdfs:label etc. here
-             instance_uris.add(s_str)
-
-    # --- Pass 2: Create nodes for identified instances ---
-    for uri in instance_uris:
-        # Check again to ensure it's not an explicitly ignored schema class/type URI
-        # This handles cases where a schema URI might have accidentally been added
-        # e.g. if RDFS.Class was subject of some triple by mistake in the graph data
-        if URIRef(uri) not in schema_classes_to_ignore and not uri.startswith(schema_prefixes):
-             nodes_data[uri] = {
-                "id": uri,
-                "label": extract_label(URIRef(uri)), # Initial label from URI fragment/qname
-                "title": f"URI: {uri}\n", # Tooltip starts with URI
-                "group": "Instance" # Default group, can be overridden by type
-            }
-
-    # --- Pass 3: Add edges and properties to the created instance nodes ---
-    for s, p, o in graph:
+    for s, p, o in graph: # Pass 3: Add edges and properties to the created instance nodes
         s_str, p_str, o_str = str(s), str(p), str(o)
-
-        # Process only if the subject is a visualized instance node
         if s_str in nodes_data:
-            node = nodes_data[s_str] # Get the node dict to update
-
-            # Case 1: Relationship edge to another visualized instance node
-            if o_str in nodes_data and isinstance(o, URIRef) and \
-               p not in schema_properties_to_ignore and \
-               not p_str.startswith(schema_prefixes):
-                 edges.append({
-                    "from": s_str,
-                    "to": o_str,
-                    "label": extract_label(p),
-                    "title": f"Predicate: {extract_label(p)}", # Tooltip for edge
-                    "arrows": "to"
-                })
-
-            # Case 2: Type definition (add info to node, don't create edge/node for class)
-            elif p == RDF.type and isinstance(o, URIRef) and \
-                 o not in schema_classes_to_ignore and not o_str.startswith(schema_prefixes):
-                type_label = extract_label(o)
-                # Add type info to tooltip
-                node['title'] += f"Type: {type_label}\n"
-                # Add type to label for clarity, avoid repeating if label is already the type
-                type_suffix = f" ({type_label})"
-                if type_suffix not in node['label'] and node['label'] != type_label:
-                    node['label'] += type_suffix
-                # Assign Vis.js group based on type for potential styling
-                node['group'] = type_label
-
-            # Case 3: Literal property assignment (add info to node tooltip/label)
+            node = nodes_data[s_str]
+            if o_str in nodes_data and isinstance(o, URIRef) and p not in schema_properties_to_ignore and not p_str.startswith(schema_prefixes):
+                 edge_id = f"{s_str}_{p_str}_{o_str}"; edges.append({"id": edge_id, "from": s_str, "to": o_str, "label": extract_label(p), "title": f"Predicate: {extract_label(p)}", "arrows": "to"})
+            elif p == RDF.type and isinstance(o, URIRef) and o not in schema_classes_to_ignore and not o_str.startswith(schema_prefixes):
+                type_label = extract_label(o); node['title'] += f"Type: {type_label}\n"; type_suffix = f" ({type_label})";
+                if type_suffix not in node['label'] and node['label'] != type_label: node['label'] += type_suffix; node['group'] = type_label
             elif isinstance(o, Literal):
-                prop_label = extract_label(p)
-                lit_label = extract_label(o)
-                # Add property to tooltip
-                node['title'] += f"{prop_label}: {lit_label}\n"
-                # Special handling for rdfs:label - use it as the primary node label
-                if p == RDFS.label:
-                    node['label'] = lit_label # Overwrite default URI-based label
+                prop_label = extract_label(p); lit_label = extract_label(o); node['title'] += f"{prop_label}: {lit_label}\n";
+                if p == RDFS.label: node['label'] = lit_label
 
-    # Clean up tooltips (remove trailing newline)
-    final_nodes = []
-    for node in nodes_data.values():
-        node['title'] = node['title'].strip()
-        final_nodes.append(node)
-
-    # Deduplicate edges (simple check based on from, to, label)
-    unique_edges_set = set()
-    unique_edges = []
+    final_nodes = [] # Pass 4: Create final node list and deduplicate edges
+    for node in nodes_data.values(): node['title'] = node['title'].strip(); final_nodes.append(node)
+    unique_edges_set = set(); unique_edges = []
     for edge in edges:
-        edge_key = (edge['from'], edge['to'], edge.get('label'))
-        if edge_key not in unique_edges_set:
-            unique_edges.append(edge)
-            unique_edges_set.add(edge_key)
-
-    # Return the filtered nodes and edges
+        if 'from' in edge and 'to' in edge: # Check essential keys exist
+            edge_key = (edge['from'], edge['to'], edge.get('label'))
+            if edge_key not in unique_edges_set: unique_edges.append(edge); unique_edges_set.add(edge_key)
+        else: logger.warning(f"[System] Skipping malformed edge in graph_to_visjs: {edge}")
     return {"nodes": final_nodes, "edges": unique_edges}
+
 
 def process_turtle_data(turtle_data, sid):
     """Process Turtle data string, add new triples to the shared accumulated_graph."""
-    # Log with SID for context
-    log_prefix = f"[SID:{sid}]" if sid else "[System]"
-
-    if not turtle_data:
-        logger.warning(f"{log_prefix} Empty Turtle data received, nothing to process.")
-        return False # Indicate nothing was added
-
+    log_prefix = f"[SID:{sid}]" if sid else "[System]" # Manual SID prefix
+    if not turtle_data: logger.warning(f"{log_prefix} Empty Turtle data received."); return False
     try:
-        # Strip potential markdown code fences and leading/trailing whitespace
-        turtle_data = turtle_data.strip()
-        if turtle_data.startswith("```turtle"):
-            turtle_data = turtle_data[len("```turtle"):].strip()
-        elif turtle_data.startswith("```"): # Handle generic code fence
-             turtle_data = turtle_data[len("```"):].strip()
-        if turtle_data.endswith("```"):
-            turtle_data = turtle_data[:-len("```")].strip()
+        turtle_data = turtle_data.strip() # Strip whitespace and potential markdown fences
+        if turtle_data.startswith("```turtle"): turtle_data = turtle_data[len("```turtle"):].strip()
+        elif turtle_data.startswith("```"): turtle_data = turtle_data[len("```"):].strip()
+        if turtle_data.endswith("```"): turtle_data = turtle_data[:-len("```")].strip()
+        if not turtle_data: logger.warning(f"{log_prefix} Turtle data empty after stripping."); return False
 
-        # Check if data is empty after stripping
-        if not turtle_data:
-             logger.warning(f"{log_prefix} Turtle data was empty after stripping markdown fences.")
-             return False
-
-        # Define prefixes string based on the current main graph to provide context for parsing the fragment
-        # This helps rdflib resolve prefixes used in the incoming turtle_data
         prefixes = "\n".join(f"@prefix {p}: <{n}> ." for p, n in accumulated_graph.namespaces())
         full_turtle_for_parsing = prefixes + "\n" + turtle_data
-
-        # Create a temporary graph to parse into. This avoids polluting the main graph if parsing fails.
-        temp_graph = Graph()
-        temp_graph.parse(data=full_turtle_for_parsing, format="turtle")
-
-        # Count how many *new* unique triples are added to the main graph
+        temp_graph = Graph(); temp_graph.parse(data=full_turtle_for_parsing, format="turtle")
         new_triples_count = 0
         for triple in temp_graph:
-            # Check if the triple does NOT already exist in the main graph
-            if triple not in accumulated_graph:
-                accumulated_graph.add(triple)
-                new_triples_count += 1
-
-        # Log information about the update
-        if new_triples_count > 0:
-            logger.info(f"{log_prefix} Added {new_triples_count} new triples to the graph. Total graph size: {len(accumulated_graph)}")
-            return True # Indicate that new triples were added
-        else:
-            logger.info(f"{log_prefix} No new triples added from the received Turtle data (data parsed OK, but triples already existed or were empty).")
-            return False # Indicate nothing new was added
-
+            if triple not in accumulated_graph: accumulated_graph.add(triple); new_triples_count += 1
+        if new_triples_count > 0: logger.info(f"{log_prefix} Added {new_triples_count} new triples. Total: {len(accumulated_graph)}"); return True
+        else: logger.info(f"{log_prefix} No new triples added from Turtle data."); return False
     except Exception as e:
-        logger.error(f"{log_prefix} Error parsing Turtle data: {e}", exc_info=True)
-        # Log the problematic data for debugging (limit length)
+        logger.error(f"{log_prefix} Error parsing Turtle data: {e}", exc_info=False) # Reduce noise maybe
         problem_data_preview = turtle_data[:500] + ('...' if len(turtle_data) > 500 else '')
-        logger.error(f"{log_prefix} Problematic Turtle data (first 500 chars):\n---\n{problem_data_preview}\n---")
-        return False # Indicate failure/no change
+        logger.error(f"{log_prefix} Problematic Turtle snippet:\n---\n{problem_data_preview}\n---")
+        return False
+
 
 def update_graph_visualization():
     """Generates Vis.js data from the shared graph and broadcasts it to all clients."""
     try:
-        # Convert the current accumulated graph to Vis.js format
         vis_data = graph_to_visjs(accumulated_graph)
-        # Broadcast the updated graph data over SocketIO to all connected clients
-        # The event name 'update_graph' should be listened for by the frontend JavaScript
-        socketio.emit('update_graph', vis_data)
-        connected_clients = len(client_buffers) # Get current count from our state management dict
-        logger.info(f"Graph visualization updated and broadcast to all ({connected_clients}) clients.")
+        socketio.emit('update_graph', vis_data) # socketio emit is threadsafe
+        connected_clients = len(client_buffers)
+        logger.info(f"[System] Graph visualization updated ({connected_clients} clients).") # Manual prefix
     except Exception as e:
-        logger.error(f"Error generating or broadcasting graph visualization: {e}", exc_info=True)
-        # Optionally emit an error event to clients
-        socketio.emit('error', {'message': f'Error generating graph visualization: {e}'})
+        logger.error(f"[System] Error generating/broadcasting graph: {e}", exc_info=True)
+        socketio.emit('error', {'message': f'Error generating graph viz: {e}'})
 
-# --- LLM Processing Functions (Run as Background Tasks) ---
+
+# --- LLM Processing Functions (Run via socketio background tasks) ---
 
 def process_with_quick_llm(text_chunk, sid):
     """Processes a text chunk with the Quick LLM to extract RDF triples."""
-    log_prefix = f"[SID:{sid}]"
-    if not quick_chat:
-        logger.error(f"{log_prefix} Quick LLM not available. Cannot process text: '{text_chunk[:50]}...'")
-        # Emit error back to the specific client that sent the data
-        socketio.emit('error', {'message': 'RDF generation service (Quick LLM) is unavailable.'}, room=sid)
-        return
-
-    logger.info(f"{log_prefix} Processing text chunk with Quick LLM: '{text_chunk[:100]}...'")
+    log_prefix = f"[SID:{sid}]" # Manual prefix
+    if not quick_chat: logger.error(f"{log_prefix} Quick LLM unavailable."); socketio.emit('error', {'message': 'RDF generation unavailable.'}, room=sid); return
+    logger.info(f"{log_prefix} Processing text with Quick LLM: '{text_chunk[:100]}...'")
     try:
-        # Send the text chunk to the LLM
-        # Ensure the LLM understands it's potentially part of a larger conversation/context if necessary,
-        # although the prompt encourages focusing only on the current chunk.
         response = quick_chat.send_message(text_chunk)
         turtle_response = response.text
-
         logger.info(f"{log_prefix} Quick LLM response received.")
-        # Log a snippet of the response for debugging
-        debug_turtle = turtle_response.strip()
-        if len(debug_turtle) > 200: debug_turtle = debug_turtle[:200] + "..."
-        logger.debug(f"{log_prefix} Quick LLM Turtle Output (raw snippet):\n---\n{debug_turtle}\n---")
-
-        # Process the Turtle data received from the LLM
-        triples_added = process_turtle_data(turtle_response, sid)
-
+        triples_added = process_turtle_data(turtle_response, sid) # Pass sid for logging within
         if triples_added:
-            # If new triples were successfully added to the graph:
-            # 1. Add the raw Turtle output to this client's buffer for potential Slow LLM processing
-            if sid in client_buffers:
-                client_buffers[sid]['quick_llm_results'].append(turtle_response)
-                buffer_size = len(client_buffers[sid]['quick_llm_results'])
-                logger.info(f"{log_prefix} Added Quick LLM result to buffer for Slow LLM. Buffer size: {buffer_size}")
-                # Check if this addition fills the chunk for the slow LLM
-                check_slow_llm_chunk(sid) # Important: check *after* adding result
-            else:
-                 logger.warning(f"{log_prefix} Client buffer not found after successful quick LLM processing. Cannot store result for slow LLM.")
-
-            # 2. Update the graph visualization for *all* connected clients
-            update_graph_visualization()
-        else:
-             # Log if the LLM responded but processing yielded no *new* triples
-             logger.info(f"{log_prefix} Quick LLM processing complete, but no new triples were added to the graph.")
-
+            if sid in client_buffers: client_buffers[sid]['quick_llm_results'].append(turtle_response); logger.info(f"{log_prefix} Added Quick result. Buffer: {len(client_buffers[sid]['quick_llm_results'])}"); check_slow_llm_chunk(sid)
+            else: logger.warning(f"{log_prefix} Client buffer missing after quick LLM.")
+            update_graph_visualization() # Update graph for all clients
+        else: logger.info(f"{log_prefix} Quick LLM processing complete, no new triples added.")
     except Exception as e:
-        logger.error(f"{log_prefix} Error during Quick LLM processing or subsequent handling: {e}", exc_info=True)
-        socketio.emit('error', {'message': f'Error processing text with Quick LLM: {e}'}, room=sid)
-
+        logger.error(f"{log_prefix} Error in Quick LLM processing: {e}", exc_info=True)
+        socketio.emit('error', {'message': f'Error processing text: {e}'}, room=sid)
 
 def process_with_slow_llm(combined_quick_results_turtle, sid):
-    """Processes combined Turtle results from Quick LLM with the Slow LLM for deeper analysis."""
-    log_prefix = f"[SID:{sid}]"
-    if not slow_chat:
-        logger.error(f"{log_prefix} Slow LLM not available. Cannot perform advanced analysis.")
-        socketio.emit('error', {'message': 'Graph analysis service (Slow LLM) is unavailable.'}, room=sid)
-        return
-
-    logger.info(f"{log_prefix} Processing {len(combined_quick_results_turtle.splitlines())} lines of previous Turtle results with Slow LLM.")
+    """Processes combined Turtle results with the Slow LLM for deeper analysis."""
+    log_prefix = f"[SID:{sid}]" # Manual prefix
+    if not slow_chat: logger.error(f"{log_prefix} Slow LLM unavailable."); socketio.emit('error', {'message': 'Graph analysis unavailable.'}, room=sid); return
+    logger.info(f"{log_prefix} Processing {len(combined_quick_results_turtle.splitlines())} lines with Slow LLM.")
     try:
-        # Serialize the current state of the *entire* accumulated graph to provide context
-        # Be mindful of token limits for the LLM. Truncate if necessary.
         current_graph_turtle = accumulated_graph.serialize(format='turtle')
-        MAX_GRAPH_CONTEXT_SLOW = 10000 # Adjust based on LLM limits and typical graph size
-        if len(current_graph_turtle) > MAX_GRAPH_CONTEXT_SLOW:
-             # Simple tail truncation; more sophisticated sampling/summarization could be used
-             current_graph_turtle = current_graph_turtle[-MAX_GRAPH_CONTEXT_SLOW:]
-             logger.warning(f"{log_prefix} Truncated current graph context (last {MAX_GRAPH_CONTEXT_SLOW} bytes) for Slow LLM input due to size.")
-
-        # Construct the detailed prompt for the Slow LLM
-        slow_llm_input = f"""
-        Existing Knowledge Graph (Turtle format, potentially partial):
-        ```turtle
-        {current_graph_turtle}
-        ```
-
-        New Information/Triples to Analyze (from previous processing steps):
-        ```turtle
-        {combined_quick_results_turtle}
-        ```
-
-        Based on the existing graph and the new information, identify higher-level concepts, implicit relationships, categories, or inconsistencies.
-        Return ONLY new Turtle triples that enhance the graph with these insights. Do not repeat triples already present in the 'Existing Knowledge Graph' section above or trivially derived from the 'New Information'.
-        Use the 'ex:' prefix. Focus on adding value through abstraction, inference, and connection. Output only valid Turtle.
-        """
-
-        # Send the combined context and new data to the Slow LLM
+        MAX_GRAPH_CONTEXT_SLOW = 10000
+        if len(current_graph_turtle) > MAX_GRAPH_CONTEXT_SLOW: logger.warning(f"{log_prefix} Truncated graph context for Slow LLM."); current_graph_turtle = current_graph_turtle[-MAX_GRAPH_CONTEXT_SLOW:]
+        slow_llm_input = f"Existing Graph:\n```turtle\n{current_graph_turtle}\n```\n\nNew Info:\n```turtle\n{combined_quick_results_turtle}\n```\n\nAnalyze..." # Keep full prompt
         response = slow_chat.send_message(slow_llm_input)
         turtle_response = response.text
-
         logger.info(f"{log_prefix} Slow LLM response received.")
-        # Log a snippet for debugging
-        debug_turtle = turtle_response.strip()
-        if len(debug_turtle) > 200: debug_turtle = debug_turtle[:200] + "..."
-        logger.debug(f"{log_prefix} Slow LLM Turtle Output (raw snippet):\n---\n{debug_turtle}\n---")
-
-        # Process the Turtle data received from the Slow LLM
-        triples_added = process_turtle_data(turtle_response, sid)
-
-        if triples_added:
-            # If the Slow LLM generated new, valid triples:
-            # 1. Update the graph visualization for all clients
-            update_graph_visualization()
-        else:
-            # Log if Slow LLM ran but produced no new insights / triples
-            logger.info(f"{log_prefix} Slow LLM analysis complete, but no new triples were added to the graph.")
-
+        triples_added = process_turtle_data(turtle_response, sid) # Pass sid
+        if triples_added: update_graph_visualization() # Update graph for all clients
+        else: logger.info(f"{log_prefix} Slow LLM analysis done, no new triples.")
     except Exception as e:
-        logger.error(f"{log_prefix} Error during Slow LLM processing or subsequent handling: {e}", exc_info=True)
-        socketio.emit('error', {'message': f'Error during graph analysis with Slow LLM: {e}'}, room=sid)
+        logger.error(f"{log_prefix} Error in Slow LLM processing: {e}", exc_info=True)
+        socketio.emit('error', {'message': f'Error during analysis: {e}'}, room=sid)
 
 
-# --- Timeout and Chunking Logic (Operates on Per-Client State) ---
+# --- Timeout and Chunking Logic ---
 
 def flush_sentence_buffer(sid):
-    """Forces processing of the sentence buffer for a specific client SID due to timeout."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-        # This might happen if the client disconnected just before the timer fired
-        logger.warning(f"{log_prefix} flush_sentence_buffer called for disconnected or unknown SID.")
-        return
-
-    # Access the specific client's state
-    state = client_buffers[sid]
-    # Mark that the timer is no longer active (it just fired)
-    state['fast_llm_timer'] = None
-
-    if not state['sentence_buffer']:
-        logger.info(f"{log_prefix} Fast LLM timeout reached, but sentence buffer is empty. No action needed.")
-        return
-
-    sentence_count = len(state['sentence_buffer'])
-    logger.info(f"{log_prefix} Fast LLM timeout reached. Flushing {sentence_count} sentences from buffer.")
-
-    # Important: Create a copy of the buffer content to process
-    sentences_to_process = list(state['sentence_buffer'])
-    # Clear the client's buffer *before* starting the background task
-    state['sentence_buffer'].clear()
-
-    # Combine the sentences into a single text chunk
-    combined_text = " ".join(sentences_to_process)
-
-    # Start the Quick LLM processing in a background task so it doesn't block the server
-    logger.info(f"{log_prefix} Starting background task for Quick LLM processing (timeout flush).")
-    socketio.start_background_task(process_with_quick_llm, combined_text, sid)
+    """Forces processing of the sentence buffer due to timeout."""
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: logger.warning(f"{log_prefix} flush_sentence_buffer for unknown SID."); return
+    state['fast_llm_timer'] = None # Mark timer inactive
+    if not state['sentence_buffer']: logger.info(f"{log_prefix} Fast timeout, buffer empty."); return
+    count = len(state['sentence_buffer']); logger.info(f"{log_prefix} Fast timeout flushing {count} sentences.")
+    sentences = list(state['sentence_buffer']); state['sentence_buffer'].clear()
+    text = " ".join(sentences)
+    # Use socketio's background task runner (integrates with eventlet)
+    socketio.start_background_task(process_with_quick_llm, text, sid)
 
 def flush_quick_llm_results(sid):
-    """Forces processing of the quick LLM results buffer for a specific client SID due to timeout."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-        logger.warning(f"{log_prefix} flush_quick_llm_results called for disconnected or unknown SID.")
-        return
-
-    state = client_buffers[sid]
-    state['slow_llm_timer'] = None # Mark timer as inactive
-
-    if not state['quick_llm_results']:
-        logger.info(f"{log_prefix} Slow LLM timeout reached, but quick results buffer is empty.")
-        return
-
-    results_count = len(state['quick_llm_results'])
-    logger.info(f"{log_prefix} Slow LLM timeout reached. Flushing {results_count} quick LLM results.")
-
-    # Copy the results and clear the buffer
-    results_to_process = list(state['quick_llm_results'])
-    state['quick_llm_results'].clear()
-
-    # Combine the Turtle snippets into one block for the Slow LLM prompt
-    # Ensure they are separated by newlines for clarity in the prompt
-    combined_turtle_text = "\n\n".join(results_to_process) # Use double newline as separator
-
-    # Start the Slow LLM processing in a background task
-    logger.info(f"{log_prefix} Starting background task for Slow LLM processing (timeout flush).")
-    socketio.start_background_task(process_with_slow_llm, combined_turtle_text, sid)
+    """Forces processing of the quick LLM results buffer due to timeout."""
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: logger.warning(f"{log_prefix} flush_quick_llm_results for unknown SID."); return
+    state['slow_llm_timer'] = None # Mark timer inactive
+    if not state['quick_llm_results']: logger.info(f"{log_prefix} Slow timeout, buffer empty."); return
+    count = len(state['quick_llm_results']); logger.info(f"{log_prefix} Slow timeout flushing {count} results.")
+    results = list(state['quick_llm_results']); state['quick_llm_results'].clear()
+    text = "\n\n".join(results)
+    # Use socketio's background task runner
+    socketio.start_background_task(process_with_slow_llm, text, sid)
 
 
 def schedule_fast_llm_timeout(sid):
     """Schedules or reschedules the fast LLM timeout for a specific client."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-         logger.warning(f"{log_prefix} Attempted to schedule fast LLM timeout for unknown SID.")
-         return
-
-    state = client_buffers[sid]
-
-    # Cancel any existing timer for this client first
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: logger.warning(f"{log_prefix} Cannot schedule fast timeout for unknown SID."); return
     if state.get('fast_llm_timer'):
-        try:
-            state['fast_llm_timer'].cancel()
-            logger.debug(f"{log_prefix} Cancelled existing fast LLM timer.")
-        except Exception as e:
-            logger.error(f"{log_prefix} Error cancelling existing fast timer: {e}")
-
-
-    # Create a new Timer object. When it expires, it will call flush_sentence_buffer(sid)
-    new_timer = Timer(FAST_LLM_TIMEOUT, flush_sentence_buffer, args=[sid])
-    new_timer.daemon = True # Allow the main program to exit even if timers are pending
-    new_timer.start()
-
-    # Store the new timer object in the client's state
-    state['fast_llm_timer'] = new_timer
-    logger.info(f"{log_prefix} Scheduled fast LLM processing timeout in {FAST_LLM_TIMEOUT} seconds.")
-
+        try: state['fast_llm_timer'].cancel()
+        except Exception as e: logger.error(f"{log_prefix} Error cancelling fast timer: {e}")
+    timer = Timer(FAST_LLM_TIMEOUT, flush_sentence_buffer, args=[sid]); timer.daemon = True; timer.start()
+    state['fast_llm_timer'] = timer; logger.info(f"{log_prefix} Scheduled fast timeout ({FAST_LLM_TIMEOUT}s).")
 
 def schedule_slow_llm_timeout(sid):
     """Schedules or reschedules the slow LLM timeout for a specific client."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-         logger.warning(f"{log_prefix} Attempted to schedule slow LLM timeout for unknown SID.")
-         return
-
-    state = client_buffers[sid]
-
-    # Cancel existing timer
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: logger.warning(f"{log_prefix} Cannot schedule slow timeout for unknown SID."); return
     if state.get('slow_llm_timer'):
-        try:
-            state['slow_llm_timer'].cancel()
-            logger.debug(f"{log_prefix} Cancelled existing slow LLM timer.")
-        except Exception as e:
-             logger.error(f"{log_prefix} Error cancelling existing slow timer: {e}")
-
-
-    # Create and start a new timer targeting the slow LLM flush function
-    new_timer = Timer(SLOW_LLM_TIMEOUT, flush_quick_llm_results, args=[sid])
-    new_timer.daemon = True
-    new_timer.start()
-
-    # Store the new timer in the client's state
-    state['slow_llm_timer'] = new_timer
-    logger.info(f"{log_prefix} Scheduled slow LLM processing timeout in {SLOW_LLM_TIMEOUT} seconds.")
+        try: state['slow_llm_timer'].cancel()
+        except Exception as e: logger.error(f"{log_prefix} Error cancelling slow timer: {e}")
+    timer = Timer(SLOW_LLM_TIMEOUT, flush_quick_llm_results, args=[sid]); timer.daemon = True; timer.start()
+    state['slow_llm_timer'] = timer; logger.info(f"{log_prefix} Scheduled slow timeout ({SLOW_LLM_TIMEOUT}s).")
 
 
 def check_fast_llm_chunk(sid):
-    """Checks if the sentence buffer for a client is full and processes it if necessary."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-        logger.warning(f"{log_prefix} check_fast_llm_chunk called for unknown SID.")
-        return
-
-    state = client_buffers[sid]
-    buffer_size = len(state['sentence_buffer'])
-
-    if buffer_size >= SENTENCE_CHUNK_SIZE:
-        logger.info(f"{log_prefix} Sentence chunk size ({buffer_size}/{SENTENCE_CHUNK_SIZE}) reached. Processing now.")
-
-        # Cancel any pending timeout timer since we are processing due to chunk size
+    """Checks if the sentence buffer is full and processes it if necessary."""
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: return
+    count = len(state['sentence_buffer'])
+    if count >= SENTENCE_CHUNK_SIZE:
+        logger.info(f"{log_prefix} Sentence chunk size ({count}/{SENTENCE_CHUNK_SIZE}) reached.")
         if state.get('fast_llm_timer'):
-            try:
-                state['fast_llm_timer'].cancel()
-                state['fast_llm_timer'] = None # Clear the timer from state
-                logger.debug(f"{log_prefix} Cancelled pending fast LLM timer due to chunk processing.")
-            except Exception as e:
-                 logger.error(f"{log_prefix} Error cancelling fast timer during chunk check: {e}")
-
-
-        # Process the chunk (similar logic to flush_sentence_buffer)
-        sentences_to_process = list(state['sentence_buffer'])
-        state['sentence_buffer'].clear()
-        combined_text = " ".join(sentences_to_process)
-
-        logger.info(f"{log_prefix} Starting background task for Quick LLM processing (chunk size reached).")
-        socketio.start_background_task(process_with_quick_llm, combined_text, sid)
-
-    elif buffer_size > 0:
-        # If the buffer has content but isn't full, ensure a timeout is scheduled.
-        # This handles cases where input stops before a chunk is full.
-        if not state.get('fast_llm_timer'):
-            logger.debug(f"{log_prefix} Buffer has {buffer_size} sentences, scheduling fast LLM timeout.")
-            schedule_fast_llm_timeout(sid)
-    # If buffer_size is 0, do nothing (no data to process, no need for a timer)
-
+            try: state['fast_llm_timer'].cancel(); state['fast_llm_timer'] = None
+            except Exception as e: logger.error(f"{log_prefix} Error cancelling fast timer: {e}")
+        sentences = list(state['sentence_buffer']); state['sentence_buffer'].clear()
+        text = " ".join(sentences)
+        logger.info(f"{log_prefix} Starting background task for Quick LLM (chunk size).")
+        socketio.start_background_task(process_with_quick_llm, text, sid)
+    elif count > 0 and not state.get('fast_llm_timer'): schedule_fast_llm_timeout(sid)
 
 def check_slow_llm_chunk(sid):
-    """Checks if the quick LLM results buffer for a client is full and processes it."""
-    log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers:
-        logger.warning(f"{log_prefix} check_slow_llm_chunk called for unknown SID.")
-        return
-
-    state = client_buffers[sid]
-    buffer_size = len(state['quick_llm_results'])
-
-    if buffer_size >= SLOW_LLM_CHUNK_SIZE:
-        logger.info(f"{log_prefix} Slow LLM chunk size ({buffer_size}/{SLOW_LLM_CHUNK_SIZE}) reached. Processing now.")
-
-        # Cancel pending slow timer
+    """Checks if the quick LLM results buffer is full and processes it."""
+    log_prefix = f"[SID:{sid}]"; state = client_buffers.get(sid)
+    if not state: return
+    count = len(state['quick_llm_results'])
+    if count >= SLOW_LLM_CHUNK_SIZE:
+        logger.info(f"{log_prefix} Slow chunk size ({count}/{SLOW_LLM_CHUNK_SIZE}) reached.")
         if state.get('slow_llm_timer'):
+            try: state['slow_llm_timer'].cancel(); state['slow_llm_timer'] = None
+            except Exception as e: logger.error(f"{log_prefix} Error cancelling slow timer: {e}")
+        results = list(state['quick_llm_results']); state['quick_llm_results'].clear()
+        text = "\n\n".join(results)
+        logger.info(f"{log_prefix} Starting background task for Slow LLM (chunk size).")
+        socketio.start_background_task(process_with_slow_llm, text, sid)
+    elif count > 0 and not state.get('slow_llm_timer'): schedule_slow_llm_timeout(sid)
+
+
+# --- Live API Interaction Functions (Running in Asyncio Thread) ---
+
+# handle_transcription_result runs in main eventlet context now
+def handle_transcription_result(text, sid):
+    """Processes transcribed text. Called by the status poller."""
+    log_prefix = f"[SID:{sid}]" # Manual prefix
+    if sid not in client_buffers: logger.warning(f"{log_prefix} Transcription result for unknown SID."); return
+    text = text.strip();
+    if not text: return # Ignore empty
+    logger.info(f"{log_prefix} Processing Transcription Result: '{text[:100]}...'")
+    try: sentences = sent_tokenize(text)
+    except Exception as e: logger.error(f"{log_prefix} NLTK error: {e}", exc_info=True); sentences = [text]
+    if not sentences: logger.warning(f"{log_prefix} Zero sentences."); return
+    state = client_buffers[sid]; state['sentence_buffer'].extend(sentences)
+    logger.info(f"{log_prefix} Added {len(sentences)} sentence(s). Buffer: {len(state['sentence_buffer'])}")
+    check_fast_llm_chunk(sid) # Trigger RDF processing pipeline
+
+# Helper to safely put status on the queue from asyncio thread
+def put_status_update(status_queue, update_dict):
+    """Safely puts status update messages onto the thread-safe queue."""
+    try:
+        if status_queue: status_queue.put_nowait(update_dict)
+    except QueueFull: logger.warning(f"[System|StatusQueue] Full, dropping: {update_dict.get('event')}")
+    except Exception as e: logger.error(f"[System|StatusQueue] Error putting status: {e}")
+
+
+async def live_api_sender(sid, session, audio_queue, status_queue):
+    """Async task (in worker thread) sending audio and putting errors on status queue."""
+    log_prefix = f"[SID:{sid}|Sender]"; logger.info(f"{log_prefix} Starting...")
+    is_active = True
+    while is_active:
+        try:
+            msg = audio_queue.get(block=True, timeout=1.0)
+            if msg is None: logger.info(f"{log_prefix} Term signal."); is_active = False; audio_queue.task_done(); break
+            # Check flag before processing message content
+            if not client_buffers.get(sid, {}).get('is_receiving_audio'): logger.info(f"{log_prefix} Client stopped (flag)."); is_active = False; audio_queue.task_done(); break
+            if session:
+                await session.send(input=msg)
+                # Use slightly longer sleep to ensure yield
+                await asyncio.sleep(0.001) # Yield control
+            else: logger.warning(f"{log_prefix} Session invalid."); await asyncio.sleep(0.1)
+            audio_queue.task_done()
+        except QueueEmpty:
+            if not client_buffers.get(sid, {}).get('is_receiving_audio'): logger.info(f"{log_prefix} Client stopped (wait)."); is_active = False
+            continue
+        except asyncio.CancelledError: logger.info(f"{log_prefix} Cancelled."); is_active = False
+        except Exception as e:
+            logger.error(f"{log_prefix} Error: {e}", exc_info=True); is_active = False
+            # Put error on status queue
+            put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Audio Send Error: {e}'}})
+    logger.info(f"{log_prefix} Stopped.")
+
+async def live_api_receiver(sid, session, status_queue):
+    """Async task (in worker thread) receiving transcriptions and putting them on status queue."""
+    log_prefix = f"[SID:{sid}|Receiver]"; logger.info(f"{log_prefix} Starting...")
+    is_active = True; current_segment = ""
+    while is_active:
+        try:
+            # Check flag before potentially blocking on receive
+            if not client_buffers.get(sid, {}).get('is_receiving_audio'): logger.info(f"{log_prefix} Client stopped (flag)."); is_active = False; break
+            if not session: logger.warning(f"{log_prefix} Session invalid."); await asyncio.sleep(0.5); continue
+
+            # Receive call might block, ensure flag check after waking
+            turn = session.receive()
+            async for response in turn:
+                # Check flag again after async iteration wakes up
+                if not client_buffers.get(sid, {}).get('is_receiving_audio'): is_active = False; break
+                if text := response.text:
+                    current_segment += text
+                    if text.endswith(('.', '?', '!')) or len(current_segment) > 100:
+                        segment = current_segment.strip(); current_segment = ""
+                        if segment: put_status_update(status_queue, {'event': 'new_transcription', 'data': {'text': segment}})
+
+            # Check flag again after turn finishes
+            if not client_buffers.get(sid, {}).get('is_receiving_audio'): is_active = False; break
+
+            if current_segment.strip() and is_active:
+                 segment = current_segment.strip(); current_segment = ""
+                 put_status_update(status_queue, {'event': 'new_transcription', 'data': {'text': segment}})
+
+            # Explicit small sleep if receive doesn't block long
+            await asyncio.sleep(0.01) # Adjust sleep time as needed (e.g., 0.01 or 0.05)
+
+        except asyncio.CancelledError: logger.info(f"{log_prefix} Cancelled."); is_active = False
+        except google_exceptions.StreamClosedError: logger.info(f"{log_prefix} API stream closed."); is_active = False
+        except Exception as e:
+            logger.error(f"{log_prefix} Error: {e}", exc_info=True); is_active = False
+            put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Receive Error: {e}'}})
+            if current_segment.strip(): logger.info(f"{log_prefix} Putting final segment on error."); put_status_update(status_queue, {'event': 'new_transcription', 'data': {'text': current_segment.strip()}})
+
+    if current_segment.strip(): logger.info(f"{log_prefix} Putting final segment after loop."); put_status_update(status_queue, {'event': 'new_transcription', 'data': {'text': current_segment.strip()}})
+    logger.info(f"{log_prefix} Stopped.")
+
+
+def run_async_session_manager(sid):
+    """Wrapper function to run the asyncio manager in a separate thread."""
+    log_prefix = f"[SID:{sid}|AsyncRunner]"; logger.info(f"{log_prefix} Thread started.")
+    state = client_buffers.get(sid); audio_queue = state.get('audio_queue'); status_queue = state.get('status_queue')
+    if not state or not audio_queue or not status_queue: logger.error(f"{log_prefix} State/Queues missing!"); return
+    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop); logger.info(f"{log_prefix} Created new asyncio loop.")
+    try: loop.run_until_complete(manage_live_session(sid, audio_queue, status_queue))
+    except Exception as e:
+        logger.error(f"{log_prefix} Unhandled error: {e}", exc_info=True)
+        if sid in client_buffers: client_buffers[sid]['is_receiving_audio'] = False; client_buffers[sid]['live_session_thread'] = None
+        put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Critical session error: {e}'}}) # Use helper
+    finally:
+        try: logger.info(f"{log_prefix} Closing loop."); loop.run_until_complete(loop.shutdown_asyncgens()); loop.close(); logger.info(f"{log_prefix} Loop closed.")
+        except Exception as close_err: logger.error(f"{log_prefix} Error closing loop: {close_err}", exc_info=True)
+        logger.info(f"{log_prefix} Thread finished.")
+        if sid in client_buffers: client_buffers[sid]['live_session_thread'] = None; client_buffers[sid]['is_receiving_audio'] = False
+
+
+async def manage_live_session(sid, audio_queue, status_queue):
+    """Manages the Google Live API session within the asyncio thread."""
+    log_prefix = f"[SID:{sid}|Manager]"; logger.info(f"{log_prefix} Async manager starting.")
+    state = client_buffers.get(sid); session_object = None
+    if not state or not live_client: logger.error(f"{log_prefix} State/Live client missing!"); return
+    try:
+        logger.info(f"{log_prefix} Connecting to Google Live API...")
+        async with live_client.aio.live.connect(model=GOOGLE_LIVE_API_MODEL, config=LIVE_API_CONFIG) as session:
+            session_object = session; logger.info(f"{log_prefix} Connected.")
+            if sid in client_buffers: client_buffers[sid]['live_session_object'] = session_object
+            else: logger.warning(f"{log_prefix} Client gone during connect."); return
+
+            put_status_update(status_queue, {'event': 'audio_started', 'data': {}}) # Signal start via queue
+
+            async with asyncio.TaskGroup() as tg:
+                logger.info(f"{log_prefix} Creating async tasks.")
+                # Start receiver FIRST, then sender
+                receiver_task = tg.create_task(live_api_receiver(sid, session_object, status_queue))
+                sender_task = tg.create_task(live_api_sender(sid, session_object, audio_queue, status_queue))
+                logger.info(f"{log_prefix} Async tasks running (Receiver started first).")
+            logger.info(f"{log_prefix} Async TaskGroup finished.")
+    except asyncio.CancelledError: logger.info(f"{log_prefix} Cancelled.")
+    except Exception as e:
+        logger.error(f"{log_prefix} Error in session: {e}", exc_info=True)
+        put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Live session error: {e}'}}) # Use helper
+    finally:
+        logger.info(f"{log_prefix} Cleaning up.")
+        if sid in client_buffers: client_buffers[sid]['is_receiving_audio'] = False; client_buffers[sid]['live_session_object'] = None
+        if audio_queue:
             try:
-                state['slow_llm_timer'].cancel()
-                state['slow_llm_timer'] = None
-                logger.debug(f"{log_prefix} Cancelled pending slow LLM timer due to chunk processing.")
-            except Exception as e:
-                 logger.error(f"{log_prefix} Error cancelling slow timer during chunk check: {e}")
+                 audio_queue.put_nowait(None) # Ensure termination signal sent
+            except QueueFull:
+                 pass # Ignore if already full
+            except Exception as e: # Catch other potential queue errors
+                 logger.warning(f"{log_prefix} Error putting None on audio queue during cleanup: {e}")
+
+        put_status_update(status_queue, {'event': 'audio_stopped', 'data': {'message': 'Session terminated.'}}) # Use helper
 
 
-        # Process the chunk (similar logic to flush_quick_llm_results)
-        results_to_process = list(state['quick_llm_results'])
-        state['quick_llm_results'].clear()
-        combined_turtle_text = "\n\n".join(results_to_process)
+# --- SocketIO Event Handlers (Running in Eventlet Context) ---
 
-        logger.info(f"{log_prefix} Starting background task for Slow LLM processing (chunk size reached).")
-        socketio.start_background_task(process_with_slow_llm, combined_turtle_text, sid)
+def status_queue_poller(sid):
+    """Eventlet background task to poll the status queue for a client."""
+    log_prefix = f"[SID:{sid}|Poller]"; logger.info(f"{log_prefix} Starting.")
+    should_run = True
+    while should_run:
+        # Check disconnect first
+        if sid not in client_buffers:
+            logger.info(f"{log_prefix} Client disconnected, stopping poller.")
+            should_run = False
+            break
 
-    elif buffer_size > 0:
-        # If the buffer has results but isn't full, ensure a timeout is running
-        if not state.get('slow_llm_timer'):
-            logger.debug(f"{log_prefix} Quick results buffer has {buffer_size} items, scheduling slow LLM timeout.")
-            schedule_slow_llm_timeout(sid)
-    # If buffer_size is 0, do nothing
+        # Poller should keep running as long as the client *might* be connected
+        # It will process any final messages put on the queue during cleanup.
 
+        state = client_buffers.get(sid) # Get current state inside loop, check existence
+        if not state: # Should be caught by above check, but safety first
+             logger.warning(f"{log_prefix} Client buffer missing unexpectedly, stopping poller.")
+             should_run = False
+             break
 
-# --- SocketIO Event Handlers ---
+        status_queue = state.get('status_queue')
+        if not status_queue: logger.error(f"{log_prefix} Status queue missing!"); should_run = False; break
+
+        try:
+            update = status_queue.get_nowait() # Non-blocking get
+            event = update.get('event'); data = update.get('data', {})
+            if event == 'new_transcription':
+                handle_transcription_result(data.get('text',''), sid)
+            elif event in ['audio_started', 'audio_stopped', 'error']:
+                logger.debug(f"{log_prefix} Emitting '{event}' based on status queue.")
+                # *** FIX: Use socketio.server.emit for background tasks ***
+                socketio.server.emit(event, data, to=sid)
+            else:
+                logger.warning(f"{log_prefix} Unknown event type from status queue: {event}")
+            status_queue.task_done()
+        except QueueEmpty:
+             eventlet.sleep(0.05) # Yield if queue is empty
+        except Exception as e:
+             logger.error(f"{log_prefix} Error processing status queue: {e}", exc_info=True); eventlet.sleep(0.5)
+    logger.info(f"{log_prefix} Stopped.")
+
 
 @socketio.on('connect')
 def handle_connect():
     """Handles a new client connection."""
-    sid = request.sid
-    # Use sid in logging for clarity when multiple clients connect
-    log_prefix = f"[SID:{sid}]"
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
     logger.info(f"{log_prefix} Client connected.")
-
-    # Initialize the state for this new client
     client_buffers[sid] = {
-        'sentence_buffer': [],
-        'quick_llm_results': [],
-        'fast_llm_timer': None, # No timers active initially
-        'slow_llm_timer': None
+        'sentence_buffer': [], 'quick_llm_results': [], 'fast_llm_timer': None, 'slow_llm_timer': None,
+        'audio_queue': ThreadSafeQueue(maxsize=50), 'status_queue': ThreadSafeQueue(maxsize=50), # Add status queue
+        'live_session_thread': None, 'live_session_object': None, 'is_receiving_audio': False,
+        'status_poller_task': None # Add poller task reference
     }
-    logger.info(f"{log_prefix} Initialized state buffers and timers.")
-
-    # Send the current state of the knowledge graph to the newly connected client
-    # This allows the visualization to be populated immediately on connection.
     try:
         vis_data = graph_to_visjs(accumulated_graph)
-        # Emit only to the connecting client using 'room=sid'
-        emit('update_graph', vis_data, room=sid)
-        logger.info(f"{log_prefix} Sent current graph state ({len(vis_data.get('nodes',[]))} nodes, {len(vis_data.get('edges',[]))} edges) to newly connected client.")
-    except Exception as e:
-        logger.error(f"{log_prefix} Error generating or sending initial graph state: {e}", exc_info=True)
-        emit('error', {'message': f'Error loading initial graph state: {e}'}, room=sid)
+        emit('update_graph', vis_data, room=sid) # room=sid is OK here (in request context)
+        logger.info(f"{log_prefix} State initialized, graph sent.")
+        # Start the status queue poller
+        poller_task = socketio.start_background_task(status_queue_poller, sid)
+        client_buffers[sid]['status_poller_task'] = poller_task
+        logger.info(f"{log_prefix} Started status queue poller.")
+    except Exception as e: logger.error(f"{log_prefix} Error during connect: {e}", exc_info=True); emit('error', {'message': f'Setup error: {e}'}, room=sid)
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handles a client disconnection."""
-    sid = request.sid
-    log_prefix = f"[SID:{sid}]"
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
     logger.info(f"{log_prefix} Client disconnected.")
-
-    # Clean up the state associated with the disconnected client
     if sid in client_buffers:
-        state = client_buffers[sid]
-        # Cancel any running timers for this client
-        if state.get('fast_llm_timer'):
-            try:
-                state['fast_llm_timer'].cancel()
-                logger.info(f"{log_prefix} Cancelled fast LLM timer on disconnect.")
-            except Exception as e:
-                 logger.error(f"{log_prefix} Error cancelling fast timer on disconnect: {e}")
+        state = client_buffers[sid]; state['is_receiving_audio'] = False # Signal flag FIRST
+        audio_queue = state.get('audio_queue')
+        if audio_queue:
+            try: audio_queue.put_nowait(None) # Signal sender stop
+            except QueueFull: pass
+            except Exception as e: logger.warning(f"{log_prefix} Error signalling audio queue: {e}")
+        thread = state.get('live_session_thread')
+        if thread and thread.is_alive(): logger.info(f"{log_prefix} Waiting for session thread..."); thread.join(timeout=1.0);
 
-        if state.get('slow_llm_timer'):
-            try:
-                state['slow_llm_timer'].cancel()
-                logger.info(f"{log_prefix} Cancelled slow LLM timer on disconnect.")
-            except Exception as e:
-                 logger.error(f"{log_prefix} Error cancelling slow timer on disconnect: {e}")
+        poller_task = state.get('status_poller_task')
+        # *** Remove poller task kill - let it exit naturally based on client_buffers check ***
+        # if poller_task:
+        #      try:
+        #          logger.info(f"{log_prefix} Killing status poller task.")
+        #          poller_task.kill() # This caused error
+        #      except Exception as e:
+        #          logger.error(f"{log_prefix} Error killing poller task: {e}", exc_info=True) # Log if kill fails
 
-        # Remove the client's state from the dictionary
-        del client_buffers[sid]
-        logger.info(f"{log_prefix} Cleaned up state and timers.")
-    else:
-         # This shouldn't normally happen if connect logic is correct
-         logger.warning(f"{log_prefix} Disconnect event received for SID not found in active buffers.")
+        if state.get('fast_llm_timer'): state['fast_llm_timer'].cancel()
+        if state.get('slow_llm_timer'): state['slow_llm_timer'].cancel()
+        del client_buffers[sid]; logger.info(f"{log_prefix} State cleaned up.")
+    else: logger.warning(f"{log_prefix} Disconnect for unknown SID.")
 
-@socketio.on('transcription_chunk')
-def handle_transcription_chunk(data):
-    """Handles incoming transcription text chunks from a client (e.g., the CLI)."""
-    sid = request.sid
-    log_prefix = f"[SID:{sid}]"
 
-    # Ensure the client is known (should have connected previously)
-    if sid not in client_buffers:
-         logger.error(f"{log_prefix} Received transcription chunk from unknown or disconnected SID. Ignoring.")
-         # Optionally, send an error back to the SID, though it might not be listening
-         # emit('error', {'message': 'Server state lost for your session, please reconnect if needed.'}, room=sid)
-         return
-
-    # Extract text, default to empty string if 'text' key is missing
-    text = data.get('text', '').strip()
-    if not text:
-        logger.warning(f"{log_prefix} Received empty transcription chunk.")
-        return
-
-    logger.info(f"{log_prefix} Received transcription chunk: '{text[:100]}...'")
-
-    # Tokenize the incoming text into sentences
-    try:
-        # Use NLTK's sentence tokenizer
-        sentences = sent_tokenize(text)
-        if not sentences: # Handle case where tokenization results in empty list
-             logger.warning(f"{log_prefix} Tokenization resulted in zero sentences for text: '{text[:50]}...'")
-             return # Nothing to add
-    except Exception as e:
-        # Fallback if NLTK fails: treat the whole chunk as one sentence
-        logger.error(f"{log_prefix} NLTK sentence tokenization failed: {e}. Treating chunk as one sentence.", exc_info=True)
-        sentences = [text]
-
-    # Add the extracted sentences to this client's sentence buffer
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    """Receives audio chunk, puts it on the thread-safe audio queue."""
+    # (Implementation remains the same)
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
+    if sid not in client_buffers: return
     state = client_buffers[sid]
-    state['sentence_buffer'].extend(sentences)
-    buffer_size = len(state['sentence_buffer'])
-    logger.info(f"{log_prefix} Added {len(sentences)} sentence(s) to buffer. New buffer size: {buffer_size}")
+    if not state.get('is_receiving_audio'): return
+    if not isinstance(data, bytes): logger.error(f"{log_prefix} Audio not bytes."); return
+    audio_queue = state.get('audio_queue')
+    if not audio_queue: logger.error(f"{log_prefix} Audio queue missing!"); return
+    try: msg = {"data": data, "mime_type": "audio/pcm"}; audio_queue.put_nowait(msg)
+    except QueueFull: logger.warning(f"{log_prefix} Audio queue full.")
+    except Exception as e: logger.error(f"{log_prefix} Error queuing audio: {e}", exc_info=True)
 
-    # Check if the buffer is now full enough to trigger fast LLM processing
-    check_fast_llm_chunk(sid)
+
+@socketio.on('start_audio')
+def handle_start_audio():
+    """Starts the background thread to manage the asyncio session."""
+    # (Implementation remains the same)
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
+    if sid not in client_buffers: logger.error(f"{log_prefix} 'start' from unknown SID."); return
+    if not live_client: logger.error(f"{log_prefix} Live client unavailable."); emit('error', {'message': 'Live service unavailable.'}, room=sid); return
+    state = client_buffers[sid]
+    thread = state.get('live_session_thread')
+    if thread and thread.is_alive(): logger.warning(f"{log_prefix} Already started."); return
+    logger.info(f"{log_prefix} Received 'start_audio'. Starting session manager thread.")
+    state['is_receiving_audio'] = True
+    status_queue = state.get('status_queue') # Clear status queue
+    if status_queue:
+        while not status_queue.empty():
+            try: status_queue.get_nowait(); status_queue.task_done()
+            except QueueEmpty: break
+            except Exception: break # Stop clearing on error
+    thread = threading.Thread(target=run_async_session_manager, args=(sid,), daemon=True)
+    state['live_session_thread'] = thread; thread.start()
+
+
+@socketio.on('stop_audio')
+def handle_stop_audio():
+    """Signals the background thread to stop the session."""
+    # (Implementation remains the same)
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
+    if sid not in client_buffers: logger.warning(f"{log_prefix} 'stop' from unknown SID."); return
+    state = client_buffers[sid]
+    if not state.get('is_receiving_audio'): logger.warning(f"{log_prefix} Already stopped."); return
+    logger.info(f"{log_prefix} Received 'stop_audio'. Signalling thread.")
+    state['is_receiving_audio'] = False
+    audio_queue = state.get('audio_queue')
+    if audio_queue:
+        try: audio_queue.put_nowait(None) # Signal stop
+        except QueueFull: pass
+        except Exception as e: logger.warning(f"{log_prefix} Error signalling queue on stop: {e}")
+    # 'audio_stopped' signal now comes via the status_queue_poller
 
 
 @socketio.on('query_graph')
 def handle_query_graph(data):
-    """Handles a natural language query about the graph from a client."""
-    sid = request.sid
-    log_prefix = f"[SID:{sid}]"
-
+    """Handles a natural language query about the graph."""
+    # (Implementation remains the same)
+    sid = request.sid; log_prefix = f"[SID:{sid}]"
     query_text = data.get('query', '').strip()
-    if not query_text:
-        logger.warning(f"{log_prefix} Received empty query.")
-        emit('query_result', {'answer': "Please provide a query text.", 'error': True}, room=sid)
-        return
-
-    # Check if the Query LLM is available
-    if not query_chat:
-        logger.error(f"{log_prefix} Query LLM is not available. Cannot process query: '{query_text}'")
-        emit('query_result', {'answer': "Sorry, the knowledge graph query service is currently unavailable.", 'error': True}, room=sid)
-        return
-
+    if not query_text: logger.warning(f"{log_prefix} Empty query."); return
+    if not query_chat: logger.error(f"{log_prefix} Query LLM unavailable."); return
     logger.info(f"{log_prefix} Received query: '{query_text}'")
-
-    # Prepare the context for the Query LLM
     try:
-        # Serialize the current accumulated graph
-        # Again, be mindful of token limits. Truncate if the graph is very large.
-        current_graph_turtle = accumulated_graph.serialize(format='turtle')
-        MAX_GRAPH_CONTEXT_QUERY = 15000 # Adjust as needed
-        if len(current_graph_turtle) > MAX_GRAPH_CONTEXT_QUERY:
-             logger.warning(f"{log_prefix} Query Graph context size ({len(current_graph_turtle)} bytes) exceeds limit ({MAX_GRAPH_CONTEXT_QUERY}). Truncating.")
-             # Simple tail truncation - might lose relevant older info
-             current_graph_turtle = current_graph_turtle[-MAX_GRAPH_CONTEXT_QUERY:]
-
-        # Construct the prompt for the Query LLM
-        query_prompt = f"""
-        Knowledge Graph:
-        ```turtle
-        {current_graph_turtle}
-        ```
-
-        User Query: "{query_text}"
-
-        ---
-        Based *only* on the 'Knowledge Graph' provided above, answer the 'User Query'.
-        Explain your reasoning by referencing specific entities (like `ex:EntityName`) and relationships from the graph.
-        If the graph does not contain the information needed, state that clearly. Do not invent information.
-        """
-
-        # Define the function to execute the LLM query (will run in background)
+        current_graph_turtle = accumulated_graph.serialize(format='turtle'); MAX_GRAPH_CONTEXT_QUERY = 15000
+        if len(current_graph_turtle) > MAX_GRAPH_CONTEXT_QUERY: logger.warning(f"{log_prefix} Truncated query context."); current_graph_turtle = current_graph_turtle[-MAX_GRAPH_CONTEXT_QUERY:]
+        query_prompt = f"Knowledge Graph:\n```turtle\n{current_graph_turtle}\n```\n\nUser Query: \"{query_text}\"\n\n---\nBased *only* on the graph..."
         def run_query_task():
             task_log_prefix = f"[SID:{sid}|QueryTask]"
-            try:
-                logger.info(f"{task_log_prefix} Sending query to Query LLM...")
-                # Send the constructed prompt to the query LLM
-                response = query_chat.send_message(query_prompt)
-                answer = response.text
-                logger.info(f"{task_log_prefix} Query LLM response received.")
-                # Emit the result back to the specific client who asked
-                socketio.emit('query_result', {'answer': answer, 'error': False}, room=sid)
-            except Exception as e:
-                logger.error(f"{task_log_prefix} Error during Query LLM processing: {e}", exc_info=True)
-                # Emit an error message back to the client
-                socketio.emit('query_result', {'answer': f"An error occurred while processing your query: {e}", 'error': True}, room=sid)
-
-        # Acknowledge the query immediately (optional, good for UX)
-        emit('query_result', {'answer': "Processing your query against the knowledge graph...", 'processing': True}, room=sid)
-
-        # Start the query execution in a background task
-        logger.info(f"{log_prefix} Starting background task for graph query.")
+            try: logger.info(f"{task_log_prefix} Sending query..."); response = query_chat.send_message(query_prompt); answer = response.text; logger.info(f"{task_log_prefix} Query response received."); socketio.emit('query_result', {'answer': answer, 'error': False}, room=sid)
+            except Exception as e: logger.error(f"{task_log_prefix} Query LLM error: {e}", exc_info=True); socketio.emit('query_result', {'answer': f"Error: {e}", 'error': True}, room=sid)
+        emit('query_result', {'answer': "Processing query...", 'processing': True}, room=sid)
         socketio.start_background_task(run_query_task)
-
-    except Exception as e:
-         # Handle errors during graph serialization or prompt preparation
-         logger.error(f"{log_prefix} Error preparing data for graph query: {e}", exc_info=True)
-         emit('query_result', {'answer': f"An internal error occurred before processing the query: {e}", 'error': True}, room=sid)
+    except Exception as e: logger.error(f"{log_prefix} Error preparing query: {e}", exc_info=True)
 
 
 # --- Flask Routes ---
 @app.route('/')
 def index():
     """Serves the main HTML page for the web interface."""
-    # Assumes you have an 'index.html' file inside a 'templates' directory
-    # in the same location as app.py
-    logger.info("Serving index.html")
+    logger.info("[System] Serving index.html") # Manual prefix
     return render_template('index.html')
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    logger.info("--- Starting VoxGraph Server ---")
-
-    # Log critical configuration settings at startup
+    logger.info("--- Starting VoxGraph Server (Threaded Asyncio V9 - Emit Fix) ---") # Version marker
     logger.info(f"Configuration: SentenceChunk={SENTENCE_CHUNK_SIZE}, SlowLLMChunk={SLOW_LLM_CHUNK_SIZE}, FastTimeout={FAST_LLM_TIMEOUT}s, SlowTimeout={SLOW_LLM_TIMEOUT}s")
-
-    # Log the status of initialized LLMs
     llm_status = {
-        "QuickLLM (RDF Extraction)": "Available" if quick_chat else "Unavailable",
-        "SlowLLM (Analysis)": "Available" if slow_chat else "Unavailable",
-        "QueryLLM (Querying)": "Available" if query_chat else "Unavailable"
+        "LiveAPI Client": "Available" if live_client else "Unavailable",
+        "QuickLLM": "Available" if quick_chat else "Unavailable",
+        "SlowLLM": "Available" if slow_chat else "Unavailable",
+        "QueryLLM": "Available" if query_chat else "Unavailable"
     }
-    logger.info(f"LLM Status: {json.dumps(llm_status)}")
-    if "Unavailable" in llm_status.values():
-        logger.warning("One or more LLMs are unavailable. Related functionality will be limited or disabled.")
+    logger.info(f"Service Status: {json.dumps(llm_status)}")
+    if not live_client:
+        logger.critical("Live API Client is UNAVAILABLE. Live transcription will not function.")
+    else:
+        logger.info("Live API Client is Available.")
+    if "Unavailable" in [llm_status['QuickLLM'], llm_status['SlowLLM'], llm_status['QueryLLM']]:
+        logger.warning("One or more standard LLM services unavailable.")
 
-    # Get port from environment or default to 5001
     port = int(os.environ.get('PORT', 5001))
     logger.info(f"Attempting to start server on http://0.0.0.0:{port}")
-
-    # Run the Flask-SocketIO development server
-    # - debug=True enables auto-reloading and verbose error pages (disable in production)
-    # - use_reloader=False is often recommended with eventlet/gevent to prevent issues
-    # - host='0.0.0.0' makes the server accessible externally (use '127.0.0.1' for local only)
     try:
+        # Run using eventlet WSGI server recommended for Flask-SocketIO
         socketio.run(app, debug=True, host='0.0.0.0', port=port, use_reloader=False)
     except OSError as e:
          if "Address already in use" in str(e):
@@ -1005,7 +838,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"FATAL: An unexpected error occurred during server startup: {e}", exc_info=True)
         sys.exit(1)
-
-    # Note for production deployment:
-    # Use a production-grade WSGI server like Gunicorn with the eventlet worker:
-    # Example: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:5001 app:app
