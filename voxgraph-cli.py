@@ -20,6 +20,7 @@ import time
 import pyaudio
 import socketio  # Use python-socketio client
 from google import genai # Keep the import
+from google.genai import types
 from dotenv import load_dotenv
 
 # --- Configuration ---
@@ -53,56 +54,20 @@ CHUNK_SIZE = 1024
 MODEL = args.model # Use model from command line args
 CONFIG = {
     "response_modalities": ["TEXT"],
-    "system_instruction": """
-    You are a transcription assistant.
-    Transcribe the audio input accurately, preserving meaning.
-    Format transcription as complete sentences when possible.
-    Return nothing else apart from the transcription text.
-    """
+    "system_instruction": types.Content(
+        parts=[
+            types.Part(
+                text=
+                    """
+                    You are a transcription assistant.
+                    Transcribe the audio input accurately, preserving meaning.
+                    Format transcription as complete sentences when possible.
+                    Return nothing else apart from the transcription text.
+                    """
+            )
+        ]
+    ),
 }
-
-# Handle compatibility for older Python versions if needed (from cli-transcribe)
-if sys.version_info < (3, 11, 0):
-    try:
-        import taskgroup
-        import exceptiongroup
-        asyncio.TaskGroup = taskgroup.TaskGroup
-        asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
-    except ImportError:
-        print("Warning: taskgroup/exceptiongroup libraries not found. "
-              "Required for Python < 3.11 for robust error handling. Using fallback.")
-        # Basic fallback
-        if not hasattr(asyncio, 'TaskGroup'):
-             # Basic fallback using gather, less robust exception handling
-            class TaskGroupFallback:
-                def __init__(self):
-                    self._tasks = []
-                async def __aenter__(self):
-                    return self
-                def create_task(self, coro):
-                    task = asyncio.create_task(coro)
-                    self._tasks.append(task)
-                    return task
-                async def __aexit__(self, exc_type, exc_val, exc_tb):
-                    if exc_type: # If an exception occurred entering the group
-                        for task in self._tasks:
-                            task.cancel()
-                        await asyncio.gather(*self._tasks, return_exceptions=True)
-                        return False # Propagate the original exception
-
-                    results = await asyncio.gather(*self._tasks, return_exceptions=True)
-                    first_exception = None
-                    for result in results:
-                        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                            if first_exception is None:
-                                first_exception = result
-                    if first_exception:
-                        for task in self._tasks:
-                             if not task.done(): task.cancel()
-                        await asyncio.gather(*[t for t in self._tasks if not t.done()], return_exceptions=True)
-                        raise first_exception
-            asyncio.TaskGroup = TaskGroupFallback
-
 
 # Initialize PyAudio
 pya = pyaudio.PyAudio()
