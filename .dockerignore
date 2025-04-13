@@ -1,0 +1,45 @@
+# Python virtual environment
+venv/
+*.venv/
+env/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env*
+
+# IDE/Editor config
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git files
+.git/
+.gitignore
+.gitattributes
+
+# Test files (optional, if you have a separate tests dir)
+tests/
+*.test.py
+pytest.ini
+.pytest_cache
+
+# Build artifacts (if any)
+dist/
+build/
+*.egg-info/
+
+# Other logs or generated files
+*.log
+*.sqlite*
+*.db
+output.car # Example if you generated test CAR files
+*.txt # If you created temporary text files
