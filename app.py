@@ -293,7 +293,8 @@ def graph_to_visjs(graph):
     # *** Define URIs used for provenance using string concatenation ***
     # Ensure EX is defined globally like: EX = URIRef("http://example.org/")
     TRANSCRIPTION_TYPE = URIRef(str(EX) + "Transcription") # Construct full URI
-    PROVENANCE_PREDICATE = URIRef(str(EX) + "sourceTranscriptionCID") # Construct full URI
+    PROVENANCE_PREDICATE = URIRef(str(EX) + "derivedFromTranscript") # Construct full URI
+
 
     # --- Pass 1: Identify instance URIs ---
     # (No changes needed here)
