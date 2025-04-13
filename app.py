@@ -19,6 +19,9 @@ import numpy as np # Keep if used elsewhere
 import io
 import asyncio
 import requests # For direct Lighthouse API calls
+import websockets.exceptions
+import threading
+
 
 # Step 3: Import Flask and related libraries
 from flask import Flask, render_template, request
@@ -662,6 +665,69 @@ def put_status_update(status_queue, update_dict):
     except Exception as e:
         logger.error(f"[System|StatusQueue] Error putting status: {e}")
 
+def terminate_audio_session(sid, wait_time=3.0):
+    """Forcibly terminate an audio session and ensure all resources are cleaned up."""
+    log_prefix = f"[SID:{sid}|Terminator]"
+    if sid not in client_buffers:
+        logger.warning(f"{log_prefix} No client buffer to terminate.")
+        return True  # Nothing to do
+    
+    state = client_buffers[sid]
+    
+    # Step 1: Signal termination via flags
+    prev_state = state.get('is_receiving_audio', False)
+    state['is_receiving_audio'] = False
+    logger.info(f"{log_prefix} Setting is_receiving_audio = False (was {prev_state})")
+    
+    # Step 2: Clear all queues
+    audio_queue = state.get('audio_queue')
+    if audio_queue:
+        try:
+            # Empty the queue first
+            while not audio_queue.empty():
+                try:
+                    audio_queue.get_nowait()
+                    audio_queue.task_done()
+                except Exception:
+                    pass
+            
+            # Send termination signal
+            try:
+                audio_queue.put_nowait(None)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"{log_prefix} Error clearing audio queue: {e}")
+    
+    # Step 3: Wait for thread termination with timeout
+    thread = state.get('live_session_thread')
+    if thread and thread.is_alive():
+        logger.info(f"{log_prefix} Waiting up to {wait_time}s for thread to terminate...")
+        thread_terminated = False
+        
+        # Wait for thread termination
+        start_time = time.time()
+        while thread.is_alive() and (time.time() - start_time) < wait_time:
+            time.sleep(0.1)
+        
+        thread_terminated = not thread.is_alive()
+        if thread_terminated:
+            logger.info(f"{log_prefix} Thread terminated successfully")
+        else:
+            logger.warning(f"{log_prefix} Thread failed to terminate in {wait_time}s")
+            # We'll force the cleanup anyway
+    
+    # Step 4: Reset all session state regardless of thread status
+    state['live_session_thread'] = None
+    state['live_session_object'] = None
+    
+    # Step 5: Create fresh queues instead of trying to clear existing ones
+    # This is safer as it avoids potential race conditions
+    state['audio_queue'] = ThreadSafeQueue(maxsize=50)
+    state['status_queue'] = ThreadSafeQueue(maxsize=50)
+    
+    logger.info(f"{log_prefix} Session terminated and resources reset")
+    return True
 
 async def live_api_sender(sid, session, audio_queue, status_queue):
     """Async task (in worker thread) sending audio and putting errors on status queue."""
@@ -745,9 +811,11 @@ async def live_api_receiver(sid, session, status_queue):
         except asyncio.CancelledError:
             logger.info(f"{log_prefix} Cancelled.")
             is_active = False
-        except google_exceptions.StreamClosedError:
-             logger.info(f"{log_prefix} API stream closed.")
-             is_active = False
+        except websockets.exceptions.ConnectionClosedError as e:
+            logger.warning(f"{log_prefix} WebSocket connection closed: {e}")
+            # Signal that we need to restart the connection
+            put_status_update(status_queue, {'event': 'connection_lost', 'data': {'message': 'Connection to Google service lost, attempting to reconnect...'}})
+            is_active = False  # End this receiver, let manager restart
         except Exception as e:
             logger.error(f"{log_prefix} Error: {e}", exc_info=True)
             is_active = False
@@ -761,29 +829,44 @@ async def live_api_receiver(sid, session, status_queue):
         put_status_update(status_queue, {'event': 'new_transcription', 'data': {'text': current_segment.strip()}})
     logger.info(f"{log_prefix} Stopped.")
 
-
 def run_async_session_manager(sid):
-    """Wrapper function to run the asyncio manager in a separate thread."""
+    """Wrapper function to run the asyncio manager in a separate thread with improved termination."""
     log_prefix = f"[SID:{sid}|AsyncRunner]"
-    logger.info(f"{log_prefix} Thread started.")
+    thread_id = threading.get_ident()
+    logger.info(f"{log_prefix} Thread started (ID: {thread_id}).")
+    
+    # Check if we still should be running
+    if sid not in client_buffers or not client_buffers[sid].get('is_receiving_audio', False):
+        logger.warning(f"{log_prefix} Client already stopped before thread fully started.")
+        # Clean up the thread reference if it's us
+        if sid in client_buffers and client_buffers[sid].get('live_session_thread'):
+            if client_buffers[sid]['live_session_thread'].ident == thread_id:
+                client_buffers[sid]['live_session_thread'] = None
+        return
+    
     state = client_buffers.get(sid)
     audio_queue = state.get('audio_queue')
     status_queue = state.get('status_queue')
+    
     if not state or not audio_queue or not status_queue:
-         logger.error(f"{log_prefix} State/Queues missing!")
-         return
+        logger.error(f"{log_prefix} State/Queues missing!")
+        return
+    
+    # Create a new event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     logger.info(f"{log_prefix} Created new asyncio loop.")
+    
     try:
+        # Run the session manager
         loop.run_until_complete(manage_live_session(sid, audio_queue, status_queue))
     except Exception as e:
         logger.error(f"{log_prefix} Unhandled error: {e}", exc_info=True)
         if sid in client_buffers:
-             client_buffers[sid]['is_receiving_audio'] = False
-             client_buffers[sid]['live_session_thread'] = None
-        put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Critical session error: {e}'}}) # Use helper
+            client_buffers[sid]['is_receiving_audio'] = False
+        put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Critical session error: {e}'}})
     finally:
+        # Clean up
         try:
             logger.info(f"{log_prefix} Closing loop.")
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -791,61 +874,187 @@ def run_async_session_manager(sid):
             logger.info(f"{log_prefix} Loop closed.")
         except Exception as close_err:
             logger.error(f"{log_prefix} Error closing loop: {close_err}", exc_info=True)
-        logger.info(f"{log_prefix} Thread finished.")
+        
+        # Clean up our thread reference only if we're still the active thread
         if sid in client_buffers:
-             client_buffers[sid]['live_session_thread'] = None
-             client_buffers[sid]['is_receiving_audio'] = False
-
+            current_thread = client_buffers[sid].get('live_session_thread')
+            if current_thread and current_thread.ident == thread_id:
+                logger.info(f"{log_prefix} Clearing our thread reference.")
+                client_buffers[sid]['live_session_thread'] = None
+                client_buffers[sid]['live_session_object'] = None
+                client_buffers[sid]['is_receiving_audio'] = False
+            else:
+                logger.info(f"{log_prefix} Not clearing thread reference - appears to be superseded.")
+        
+        logger.info(f"{log_prefix} Thread finishing (ID: {thread_id}).")
 
 async def manage_live_session(sid, audio_queue, status_queue):
-    """Manages the Google Live API session within the asyncio thread."""
+    """Manages the Google Live API session with improved termination handling."""
     log_prefix = f"[SID:{sid}|Manager]"
-    logger.info(f"{log_prefix} Async manager starting.")
+    thread_id = threading.get_ident()
+    logger.info(f"{log_prefix} Async manager starting (Thread ID: {thread_id}).")
+    
+    # Add retry parameters
+    max_retries = 5
+    retry_count = 0
+    base_delay = 1.0  # Start with 1 second delay
+    
+    # Get state - verify we should still be running
     state = client_buffers.get(sid)
-    session_object = None
-    if not state or not live_client:
-        logger.error(f"{log_prefix} State/Live client missing!")
+    if not state or not state.get('is_receiving_audio', False):
+        logger.warning(f"{log_prefix} Client no longer active before session start.")
+        return
+    
+    if not live_client:
+        logger.error(f"{log_prefix} Live client missing!")
         put_status_update(status_queue, {'event': 'error', 'data': {'message': 'Server configuration error for live session.'}})
         return
-    try:
-        logger.info(f"{log_prefix} Connecting to Google Live API...")
-        async with live_client.aio.live.connect(model=GOOGLE_LIVE_API_MODEL, config=LIVE_API_CONFIG) as session:
-            session_object = session
-            logger.info(f"{log_prefix} Connected.")
-            if sid in client_buffers:
-                 client_buffers[sid]['live_session_object'] = session_object
-            else:
-                 logger.warning(f"{log_prefix} Client gone during connect.")
-                 return
+    
+    # Check if our thread is still the active one
+    if state.get('live_session_thread') and state['live_session_thread'].ident != thread_id:
+        logger.warning(f"{log_prefix} We're not the active thread anymore.")
+        return
+    
+    while retry_count <= max_retries and client_buffers.get(sid, {}).get('is_receiving_audio', False):
+        session_object = None
+        try:
+            # Calculate backoff time if this is a retry
+            if retry_count > 0:
+                delay = min(base_delay * (2 ** (retry_count - 1)), 15)  # Exponential backoff capped at 15 seconds
+                logger.info(f"{log_prefix} Retry {retry_count}/{max_retries}, waiting {delay:.1f}s before reconnecting...")
+                
+                # Check frequently during the delay if we should still be running
+                start_time = time.time()
+                while (time.time() - start_time < delay) and client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                    await asyncio.sleep(0.1)
+                
+                # Verify again we should continue
+                if not client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                    logger.info(f"{log_prefix} Client no longer receiving audio after retry delay.")
+                    break
+                
+                # Check if our thread is still the active one
+                current_thread = client_buffers.get(sid, {}).get('live_session_thread')
+                if not current_thread or current_thread.ident != thread_id:
+                    logger.warning(f"{log_prefix} Thread superseded during retry delay.")
+                    break
+                
+                # Notify client of reconnection attempt
+                put_status_update(status_queue, {'event': 'reconnecting', 'data': {'attempt': retry_count, 'max': max_retries}})
+            
+            # Final check before connection attempt
+            if not client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                logger.info(f"{log_prefix} Client stopped before connection attempt.")
+                break
+            
+            logger.info(f"{log_prefix} Connecting to Google Live API...")
+            async with live_client.aio.live.connect(model=GOOGLE_LIVE_API_MODEL, config=LIVE_API_CONFIG) as session:
+                session_object = session
+                logger.info(f"{log_prefix} Connected.")
+                
+                # Check if we should proceed
+                if not client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                    logger.info(f"{log_prefix} Client stopped after connection established.")
+                    break
+                
+                # Check if our thread is still the active one
+                current_thread = client_buffers.get(sid, {}).get('live_session_thread')
+                if not current_thread or current_thread.ident != thread_id:
+                    logger.warning(f"{log_prefix} Thread superseded after connection.")
+                    break
+                
+                # Store session object
+                if sid in client_buffers:
+                    client_buffers[sid]['live_session_object'] = session_object
+                else:
+                    logger.warning(f"{log_prefix} Client gone during connect.")
+                    break
 
-            put_status_update(status_queue, {'event': 'audio_started', 'data': {}}) # Signal start via queue
+                # Reset retry counter upon successful connection
+                if retry_count > 0:
+                    put_status_update(status_queue, {'event': 'reconnected', 'data': {}})
+                    logger.info(f"{log_prefix} Successfully reconnected after {retry_count} attempts.")
+                    retry_count = 0
+                else:
+                    put_status_update(status_queue, {'event': 'audio_started', 'data': {}})
 
-            async with asyncio.TaskGroup() as tg:
-                logger.info(f"{log_prefix} Creating async tasks.")
-                receiver_task = tg.create_task(live_api_receiver(sid, session_object, status_queue))
-                sender_task = tg.create_task(live_api_sender(sid, session_object, audio_queue, status_queue))
-                logger.info(f"{log_prefix} Async tasks running (Receiver started first).")
-            logger.info(f"{log_prefix} Async TaskGroup finished.")
-    except asyncio.CancelledError:
-        logger.info(f"{log_prefix} Cancelled.")
-    except Exception as e:
-        logger.error(f"{log_prefix} Error in session: {e}", exc_info=True)
-        put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Live session error: {e}'}}) # Use helper
-    finally:
-        logger.info(f"{log_prefix} Cleaning up.")
-        if sid in client_buffers:
-             client_buffers[sid]['is_receiving_audio'] = False
-             client_buffers[sid]['live_session_object'] = None
-        if audio_queue:
-            try:
-                 audio_queue.put_nowait(None)
-            except QueueFull:
-                 pass
-            except Exception as e:
-                 logger.warning(f"{log_prefix} Error putting None on audio queue during cleanup: {e}")
+                # Run the sender and receiver tasks - make task group more cancellation aware
+                try:
+                    async with asyncio.TaskGroup() as tg:
+                        logger.info(f"{log_prefix} Creating async tasks.")
+                        receiver_task = tg.create_task(live_api_receiver(sid, session_object, status_queue))
+                        sender_task = tg.create_task(live_api_sender(sid, session_object, audio_queue, status_queue))
+                        logger.info(f"{log_prefix} Async tasks running (Receiver started first).")
+                        
+                        # Regularly check if we should still be running
+                        while client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                            # Check if our thread is still the active one
+                            current_thread = client_buffers.get(sid, {}).get('live_session_thread')
+                            if not current_thread or current_thread.ident != thread_id:
+                                logger.warning(f"{log_prefix} Thread superseded during active session.")
+                                # This will cancel the task group
+                                raise asyncio.CancelledError()
+                            
+                            # Brief yield to allow tasks to run and detect termination
+                            await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    logger.info(f"{log_prefix} Task group cancelled.")
+                    # Just exit the with block, tasks will be cleaned up
+                
+                # Check if client still wants audio processing
+                if not client_buffers.get(sid, {}).get('is_receiving_audio', False):
+                    logger.info(f"{log_prefix} Client no longer receiving audio after session ended.")
+                    break
+                
+                # If we reach here, we need to reconnect
+                retry_count += 1
+                
+        except websockets.exceptions.ConnectionClosedError as e:
+            # WebSocket connection closed - retry
+            retry_count += 1
+            logger.warning(f"{log_prefix} WebSocket connection closed during setup: {e}. Retry {retry_count}/{max_retries}")
+            continue
+            
+        except asyncio.CancelledError:
+            logger.info(f"{log_prefix} Cancelled.")
+            break
+            
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"{log_prefix} Error in session: {e}", exc_info=True)
+            put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Live session error: {e}'}})
+            
+            # If this was a severe error or we've reached max retries, stop trying
+            if retry_count > max_retries:
+                logger.error(f"{log_prefix} Max retries ({max_retries}) reached. Giving up.")
+                put_status_update(status_queue, {'event': 'error', 'data': {'message': f'Failed to maintain connection after {max_retries} attempts.'}})
+                break
+    
+    # Final cleanup
+    logger.info(f"{log_prefix} Cleaning up session (Thread ID: {thread_id}).")
+    
+    # Only clear our own session
+    if sid in client_buffers:
+        current_thread = client_buffers.get(sid, {}).get('live_session_thread')
+        if current_thread and current_thread.ident == thread_id:
+            client_buffers[sid]['is_receiving_audio'] = False
+            client_buffers[sid]['live_session_object'] = None
+        else:
+            logger.info(f"{log_prefix} Not clearing session objects - appears to be superseded.")
+    
+    # Always signal the audio queue
+    if audio_queue:
+        try:
+            audio_queue.put_nowait(None)
+        except QueueFull:
+            pass
+        except Exception as e:
+            logger.warning(f"{log_prefix} Error putting None on audio queue during cleanup: {e}")
 
-        put_status_update(status_queue, {'event': 'audio_stopped', 'data': {'message': 'Session terminated.'}}) # Use helper
-
+    # Always send the stopped event
+    put_status_update(status_queue, {'event': 'audio_stopped', 'data': {'message': 'Session terminated.'}})
+    
+    logger.info(f"{log_prefix} Session manager finished (Thread ID: {thread_id}).")
 
 # --- SocketIO Event Handlers ---
 
@@ -964,47 +1173,61 @@ def handle_audio_chunk(data):
 
 @socketio.on('start_audio')
 def handle_start_audio():
-    sid = request.sid; log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers: logger.error(f"{log_prefix} 'start' from unknown SID."); return
-    if not live_client: logger.error(f"{log_prefix} Live client unavailable."); emit('error', {'message': 'Live service unavailable.'}, room=sid); return
+    sid = request.sid
+    log_prefix = f"[SID:{sid}]"
+    
+    if sid not in client_buffers:
+        logger.error(f"{log_prefix} 'start' from unknown SID.")
+        return
+    
+    if not live_client:
+        logger.error(f"{log_prefix} Live client unavailable.")
+        emit('error', {'message': 'Live service unavailable.'}, room=sid)
+        return
+    
     state = client_buffers[sid]
-    thread = state.get('live_session_thread')
-    if thread and thread.is_alive(): logger.warning(f"{log_prefix} Already started."); return
-    logger.info(f"{log_prefix} Received 'start_audio'. Starting session manager thread.")
+    
+    # Forcibly terminate any existing session regardless of state
+    logger.info(f"{log_prefix} Ensuring clean state before starting new session")
+    terminate_audio_session(sid)
+    
+    # Now we know we have a clean state, start a new session
+    logger.info(f"{log_prefix} Received 'start_audio'. Starting fresh session.")
+    
+    # Initialize the status queue poller if needed
+    if not state.get('status_poller_task'):
+        poller_task = socketio.start_background_task(status_queue_poller, sid)
+        state['status_poller_task'] = poller_task
+        logger.info(f"{log_prefix} Started new status queue poller.")
+    
+    # Set recording flag and start new thread
     state['is_receiving_audio'] = True
-    status_queue = state.get('status_queue')
-    if status_queue:
-        while not status_queue.empty():
-            try:
-                status_queue.get_nowait()
-                status_queue.task_done()
-            except QueueEmpty:
-                break
-            except Exception:
-                 break # Stop clearing on error
     thread = threading.Thread(target=run_async_session_manager, args=(sid,), daemon=True)
     state['live_session_thread'] = thread
     thread.start()
-
+    logger.info(f"{log_prefix} New audio session thread started (ID: {thread.ident})")
 
 @socketio.on('stop_audio')
 def handle_stop_audio():
-    sid = request.sid; log_prefix = f"[SID:{sid}]"
-    if sid not in client_buffers: logger.warning(f"{log_prefix} 'stop' from unknown SID."); return
+    sid = request.sid
+    log_prefix = f"[SID:{sid}]"
+    
+    if sid not in client_buffers:
+        logger.warning(f"{log_prefix} 'stop' from unknown SID.")
+        return
+    
     state = client_buffers[sid]
-    if not state.get('is_receiving_audio'): logger.warning(f"{log_prefix} Already stopped."); return
-    logger.info(f"{log_prefix} Received 'stop_audio'. Signalling thread.")
-    state['is_receiving_audio'] = False
-    audio_queue = state.get('audio_queue')
-    if audio_queue:
-        try:
-            audio_queue.put_nowait(None) # Signal stop
-        except QueueFull:
-            pass
-        except Exception as e:
-            logger.warning(f"{log_prefix} Error signalling queue on stop: {e}")
-    # 'audio_stopped' signal now comes via the status_queue_poller
-
+    if not state.get('is_receiving_audio', False):
+        logger.warning(f"{log_prefix} Already stopped.")
+        # Force cleanup anyway to ensure clean state
+        terminate_audio_session(sid)
+        return
+    
+    logger.info(f"{log_prefix} Received 'stop_audio'. Terminating session.")
+    terminate_audio_session(sid)
+    
+    # The 'audio_stopped' signal will come via the status_queue_poller or emit it directly
+    socketio.emit('audio_stopped', {'message': 'Audio recording stopped by user'}, room=sid)
 
 @socketio.on('query_graph')
 def handle_query_graph(data):
