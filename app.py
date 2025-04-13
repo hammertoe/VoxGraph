@@ -334,6 +334,7 @@ def graph_to_visjs(graph):
                  edge_data = { "id": edge_id, "from": s_str, "to": o_str, "label": edge_label, "title": f"Predicate: {edge_label}", "arrows": "to" }
                  if p == PROVENANCE_PREDICATE:
                      edge_data["dashes"] = True
+                     edge_data["color"] = 'lightgray'
                      # edge_data["label"] = "source" # Optional short label
                  edges.append(edge_data)
             elif p == RDF.type and isinstance(o, URIRef):
