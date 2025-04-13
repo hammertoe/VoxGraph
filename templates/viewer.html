@@ -9,15 +9,99 @@
     <!-- Include Vis.js for graph visualization -->
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+    <!-- Font Awesome for Icons (Optional, but needed if using icon groups) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+
     <style>
-        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: sans-serif;}
-        #graph-container { width: 100%; height: calc(100% - 25px); /* Account for status bar */ border: none; }
-        #mynetwork { width: 100%; height: 100%; border: none; }
-        #status { padding: 5px; font-size: 0.9em; background-color: #f0f0f0; border-top: 1px solid #ccc; position: fixed; bottom: 0; width: 100%; text-align: center; }
+        html, body {
+            height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: sans-serif;
+        }
+        #controls { /* New container for controls */
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(240, 240, 240, 0.8);
+            padding: 8px 12px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            z-index: 10;
+            display: flex; /* Align items horizontally */
+            align-items: center; /* Center items vertically */
+        }
+        /* Toggle Switch Styles */
+        .switch-container {
+            display: flex;
+            align-items: center;
+            margin-right: 10px; /* Space before label */
+        }
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 50px; /* Width of the switch */
+            height: 24px; /* Height of the switch */
+        }
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 24px; /* Rounded corners */
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px; /* Size of the knob */
+            width: 18px;
+            left: 3px; /* Position of the knob */
+            bottom: 3px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%; /* Make it round */
+        }
+        input:checked + .slider {
+            background-color: #2196F3; /* Color when ON */
+        }
+        input:checked + .slider:before {
+            transform: translateX(26px); /* Move knob to the right */
+        }
+        #graph-container {
+            width: 100%;
+            height: calc(100% - 25px); /* Account for status bar */
+            border: none;
+        }
+        #mynetwork {
+            width: 100%; height: 100%; border: none;
+        }
+        #status {
+            padding: 5px; font-size: 0.9em; background-color: #f0f0f0;
+            border-top: 1px solid #ccc; position: fixed; bottom: 0;
+            width: 100%; text-align: center; z-index: 5; /* Ensure status is below controls */
+        }
         .error { color: red; font-weight: bold; }
     </style>
 </head>
 <body>
+    <!-- Control Bar -->
+    <div id="controls">
+         <div class="switch-container">
+            <label class="switch">
+                <input type="checkbox" id="provenanceToggle">
+                <span class="slider"></span>
+            </label>
+             <span>Provenance</span> <!-- Label for the switch -->
+         </div>
+        <!-- Add other controls like Export button here if needed -->
+        <!-- <button id="exportPngButton">Export PNG</button> -->
+    </div>
 
     <div id="graph-container">
         <div id="mynetwork"></div>
@@ -27,18 +111,46 @@
     <script>
         const statusDiv = document.getElementById('status');
         const networkContainer = document.getElementById('mynetwork');
+        const provenanceToggle = document.getElementById('provenanceToggle'); // Get the toggle switch
 
         // --- Config ---
-        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+        const SERVER_URL = `http://${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+        const PROVENANCE_NODE_GROUP = "Transcription"; // Group name assigned by backend
+        const PROVENANCE_EDGE_LABEL = "sourceTranscriptionCID"; // Edge label assigned by backend
 
         // --- State ---
         let socket = null;
+        let showProvenance = false; // Default to false (hidden)
 
         // --- Vis.js Graph Setup ---
         let network = null;
+        // Original datasets holding ALL data from server
         const nodes = new vis.DataSet([]);
         const edges = new vis.DataSet([]);
-        const graphData = { nodes: nodes, edges: edges };
+
+        // Filter function for nodes and edges
+        function provenanceFilter(item) {
+            if (showProvenance) {
+                return true; // Show everything if toggled ON
+            } else {
+                // Hide nodes with the specific group and edges with the specific label
+                if (item.group === PROVENANCE_NODE_GROUP) {
+                    return false; // Hide transcription node
+                }
+                if (item.label === PROVENANCE_EDGE_LABEL) {
+                    return false; // Hide provenance edge
+                }
+                return true; // Show all other items
+            }
+        }
+
+        // DataViews based on the original datasets and the filter function
+        const nodeView = new vis.DataView(nodes, { filter: provenanceFilter });
+        const edgeView = new vis.DataView(edges, { filter: provenanceFilter });
+
+        // Graph data object now uses the DataViews
+        const graphData = { nodes: nodeView, edges: edgeView };
+
         const graphOptions = {
             nodes: {
                 shape: 'dot',
@@ -49,42 +161,76 @@
             edges: {
                 width: 2,
                 arrows: 'to',
-                font: { align: 'horizontal', middle: true, size: 10 }
+                font: { align: 'horizontal', middle: true, size: 10 },
+                smooth: { // Optional: improve performance slightly
+                    enabled: true,
+                    type: "dynamic",
+                    roundness: 0.5
+                }
             },
             physics: {
+                 enabled: true, // Make sure physics is enabled
                  barnesHut: { gravitationalConstant: -8000, springConstant: 0.04, springLength: 150 }
             },
-             groups: { // Example groups for styling
+             groups: { // Define groups for styling
                  Person: { color:{background:'lightblue', border:'blue'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf007', size: 50, color: 'blue'} },
                  Organization: { color:{background:'lightgreen', border:'green'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf1ad', size: 50, color: 'green'} },
                  Project: { color:{background:'lightcoral', border:'red'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf0b1', size: 50, color: 'red'} },
+                 // Style for the Transcription nodes when visible
+                 [PROVENANCE_NODE_GROUP]: { // Use the constant here
+                    color: { background: '#f0e68c', border: '#adad85'}, // Khaki color
+                    shape: 'icon',
+                    icon: { face: 'FontAwesome', code: '\uf15c', size: 30, color: '#8b4513' }, // File-text icon, saddlebrown
+                    size: 10 // Make them smaller
+                 },
                  Instance: { color: { background: '#CCCCCC', border: '#AAAAAA' } } // Default
              }
+             // Note: Edge styling (like dashes) is applied via the data property added by the backend
         };
 
         function initializeGraph() {
+            // Initialize network with the DataViews
             network = new vis.Network(networkContainer, graphData, graphOptions);
-            console.log("Vis.js Network initialized.");
+            console.log("Vis.js Network initialized with DataViews.");
         }
 
         function updateGraph(data) {
             console.log("Received graph update:", data);
             try {
-                const receivedNodeIds = new Set(data.nodes.map(n => n.id));
-                const nodesToRemove = nodes.getIds().filter(id => !receivedNodeIds.has(id));
-                if (nodesToRemove.length > 0) nodes.remove(nodesToRemove);
+                // Update the original DataSets - the Views will update automatically
+                const nodesToAddUpdate = data.nodes || [];
+                const edgesToAddUpdate = (data.edges || []).map((e, index) => ({
+                     id: e.id || `${e.from}-${e.to}-${e.label || index}`, ...e })); // Ensure edges have IDs
 
-                const edgesWithGeneratedIds = data.edges.map((e, index) => ({
-                     id: e.id || `${e.from}-${e.to}-${e.label || index}`, ...e }));
-                const receivedEdgeIds = new Set(edgesWithGeneratedIds.map(e => e.id));
-                const edgesToRemove = edges.getIds().filter(id => !receivedEdgeIds.has(id));
-                 // Also remove edges connected to removed nodes (more robustly)
-                 edges.get({filter: edge => nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to)})
-                      .forEach(edge => { if (!edgesToRemove.includes(edge.id)) edgesToRemove.push(edge.id);});
-                if (edgesToRemove.length > 0) edges.remove(edgesToRemove);
+                 // --- More efficient update using diff ---
+                 const currentNodeIds = new Set(nodes.getIds());
+                 const currentEdgeIds = new Set(edges.getIds());
+                 const receivedNodeIds = new Set(nodesToAddUpdate.map(n => n.id));
+                 const receivedEdgeIds = new Set(edgesToAddUpdate.map(e => e.id));
 
-                nodes.update(data.nodes);
-                edges.update(edgesWithGeneratedIds);
+                 const nodesToRemove = [...currentNodeIds].filter(id => !receivedNodeIds.has(id));
+                 const edgesToRemove = [...currentEdgeIds].filter(id => !receivedEdgeIds.has(id));
+
+                  // Remove edges connected to removed nodes
+                  edges.get({ filter: edge => nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to) })
+                       .forEach(edge => { if (!edgesToRemove.includes(edge.id)) edgesToRemove.push(edge.id); });
+
+
+                 if (nodesToRemove.length > 0) {
+                     console.debug("Removing nodes:", nodesToRemove);
+                     nodes.remove(nodesToRemove);
+                 }
+                 if (edgesToRemove.length > 0) {
+                    console.debug("Removing edges:", edgesToRemove);
+                    edges.remove(edgesToRemove);
+                 }
+                 if (nodesToAddUpdate.length > 0) {
+                     nodes.update(nodesToAddUpdate);
+                 }
+                 if (edgesToAddUpdate.length > 0) {
+                     edges.update(edgesToAddUpdate);
+                 }
+                 console.debug(`Graph updated: ${nodes.length} nodes, ${edges.length} edges in DataSet.`);
 
             } catch (error) {
                 console.error("Error updating graph:", error);
@@ -99,7 +245,7 @@
             socket = io(SERVER_URL);
 
             socket.on('connect', () => {
-                updateStatus("Connected to server. Waiting for graph updates.");
+                updateStatus("Connected. Waiting for updates.");
             });
 
             socket.on('disconnect', (reason) => {
@@ -110,16 +256,15 @@
                 updateStatus(`Connection error: ${err.message}`, true);
             });
 
-            socket.on('error', (data) => { // Listen for general server errors
+            socket.on('error', (data) => {
                 updateStatus(`Server error: ${data.message}`, true);
             });
 
-            // Listen ONLY for graph updates
             socket.on('update_graph', (data) => {
                 if (network) {
                     updateGraph(data);
                 } else {
-                    console.warn("Received graph update but network not initialized yet.");
+                    console.warn("Graph update received before network init.");
                 }
             });
         }
@@ -130,9 +275,26 @@
             statusDiv.className = isError ? 'error' : '';
         }
 
+        // --- Toggle Switch Logic ---
+        if (provenanceToggle) {
+            provenanceToggle.checked = showProvenance; // Initialize based on default state
+            provenanceToggle.addEventListener('change', (event) => {
+                showProvenance = event.target.checked;
+                console.log(`Provenance visibility set to: ${showProvenance}`);
+                // Refresh the DataViews to apply the new filter state
+                if (nodeView && edgeView) {
+                    nodeView.refresh();
+                    edgeView.refresh();
+                }
+            });
+        } else {
+            console.error("Provenance toggle switch not found!");
+        }
+
+
         // --- Initialization ---
         document.addEventListener('DOMContentLoaded', () => {
-            initializeGraph();
+            initializeGraph(); // Init with DataViews
             connectSocket();
         });
 

@@ -281,7 +281,8 @@ def extract_label(uri_or_literal):
         return str(uri_or_literal)
 
 def graph_to_visjs(graph):
-    """Converts an rdflib Graph to Vis.js nodes and edges format, focusing on instances."""
+    """Converts an rdflib Graph to Vis.js nodes and edges format, focusing on instances
+       and adding specific styling for provenance elements."""
     nodes_data = {}
     edges = []
     instance_uris = set()
@@ -289,56 +290,75 @@ def graph_to_visjs(graph):
     schema_classes_to_ignore = {OWL.Class, RDFS.Class, RDF.Property, OWL.ObjectProperty, OWL.DatatypeProperty, RDFS.Resource, OWL.Thing}
     schema_prefixes = (str(RDF), str(RDFS), str(OWL), str(XSD))
 
-    for s, p, o in graph: # Pass 1: Identify instance URIs
+    # *** Define URIs used for provenance using string concatenation ***
+    # Ensure EX is defined globally like: EX = URIRef("http://example.org/")
+    TRANSCRIPTION_TYPE = URIRef(str(EX) + "Transcription") # Construct full URI
+    PROVENANCE_PREDICATE = URIRef(str(EX) + "sourceTranscriptionCID") # Construct full URI
+
+    # --- Pass 1: Identify instance URIs ---
+    # (No changes needed here)
+    for s, p, o in graph:
         s_str, p_str, o_str = str(s), str(p), str(o)
-        if p == RDF.type and isinstance(s, URIRef) and isinstance(o, URIRef) and o not in schema_classes_to_ignore and not s_str.startswith(schema_prefixes) and not o_str.startswith(schema_prefixes):
-             instance_uris.add(s_str)
-        elif isinstance(s, URIRef) and isinstance(o, URIRef) and p not in schema_properties_to_ignore and not s_str.startswith(schema_prefixes) and not o_str.startswith(schema_prefixes) and not p_str.startswith(schema_prefixes):
-             instance_uris.add(s_str)
-             instance_uris.add(o_str)
-        elif isinstance(s, URIRef) and isinstance(o, Literal) and not s_str.startswith(schema_prefixes) and not p_str.startswith(schema_prefixes):
-             instance_uris.add(s_str)
+        if p == RDF.type and isinstance(s, URIRef) and isinstance(o, URIRef) and \
+           o not in schema_classes_to_ignore and not s_str.startswith(schema_prefixes) and \
+           not o_str.startswith(schema_prefixes): instance_uris.add(s_str)
+        elif isinstance(s, URIRef) and isinstance(o, URIRef) and \
+             p not in schema_properties_to_ignore and \
+             not s_str.startswith(schema_prefixes) and \
+             not o_str.startswith(schema_prefixes) and \
+             not p_str.startswith(schema_prefixes): instance_uris.add(s_str); instance_uris.add(o_str)
+        elif isinstance(s, URIRef) and isinstance(o, Literal) and \
+             not s_str.startswith(schema_prefixes) and \
+             not p_str.startswith(schema_prefixes): instance_uris.add(s_str)
 
-    for uri in instance_uris: # Pass 2: Create nodes for identified instances
+
+    # --- Pass 2: Create nodes for identified instances ---
+    # (No changes needed here)
+    for uri in instance_uris:
         if URIRef(uri) not in schema_classes_to_ignore and not uri.startswith(schema_prefixes):
-            nodes_data[uri] = {"id": uri, "label": extract_label(URIRef(uri)), "title": f"URI: {uri}\n", "group": "Instance"}
+             nodes_data[uri] = {"id": uri, "label": extract_label(URIRef(uri)), "title": f"URI: {uri}\n", "group": "Instance"} # Default group
 
-    for s, p, o in graph: # Pass 3: Add edges and properties to the created instance nodes
+
+    # --- Pass 3: Add edges and properties, apply provenance styling ---
+    # (Rest of the function remains the same as the previous corrected version)
+    for s, p, o in graph:
         s_str, p_str, o_str = str(s), str(p), str(o)
         if s_str in nodes_data:
-            node = nodes_data[s_str]
-            if o_str in nodes_data and isinstance(o, URIRef) and p not in schema_properties_to_ignore and not p_str.startswith(schema_prefixes):
+            node = nodes_data[s_str] # Get the node dict to update
+            if o_str in nodes_data and isinstance(o, URIRef) and \
+               p not in schema_properties_to_ignore and \
+               not p_str.startswith(schema_prefixes):
+                 edge_label = extract_label(p)
                  edge_id = f"{s_str}_{p_str}_{o_str}"
-                 edges.append({"id": edge_id, "from": s_str, "to": o_str, "label": extract_label(p), "title": f"Predicate: {extract_label(p)}", "arrows": "to"})
-            elif p == RDF.type and isinstance(o, URIRef) and o not in schema_classes_to_ignore and not o_str.startswith(schema_prefixes):
-                type_label = extract_label(o)
-                node['title'] += f"Type: {type_label}\n"
-                type_suffix = f" ({type_label})"
-                if type_suffix not in node['label'] and node['label'] != type_label:
-                     node['label'] += type_suffix
-                node['group'] = type_label
+                 edge_data = { "id": edge_id, "from": s_str, "to": o_str, "label": edge_label, "title": f"Predicate: {edge_label}", "arrows": "to" }
+                 if p == PROVENANCE_PREDICATE:
+                     edge_data["dashes"] = True
+                     # edge_data["label"] = "source" # Optional short label
+                 edges.append(edge_data)
+            elif p == RDF.type and isinstance(o, URIRef):
+                if o == TRANSCRIPTION_TYPE:
+                     node['group'] = "Transcription"
+                     node['label'] = "Txn: " + extract_label(s)
+                elif o not in schema_classes_to_ignore and not o_str.startswith(schema_prefixes):
+                     type_label = extract_label(o); node['title'] += f"Type: {type_label}\n"; type_suffix = f" ({type_label})";
+                     if type_suffix not in node['label'] and node['label'] != type_label: node['label'] += type_suffix
+                     if node.get('group') != "Transcription": node['group'] = type_label
             elif isinstance(o, Literal):
-                prop_label = extract_label(p)
-                lit_label = extract_label(o)
+                prop_label = extract_label(p); lit_label = extract_label(o);
                 node['title'] += f"{prop_label}: {lit_label}\n"
                 if p == RDFS.label:
-                    node['label'] = lit_label
+                    if node.get('group') != "Transcription": node['label'] = lit_label
 
-    final_nodes = [] # Pass 4: Create final node list and deduplicate edges
-    for node in nodes_data.values():
-        node['title'] = node['title'].strip()
-        final_nodes.append(node)
-    unique_edges_set = set()
-    unique_edges = []
+    # --- Pass 4: Create final node list and deduplicate edges ---
+    final_nodes = []
+    for node in nodes_data.values(): node['title'] = node['title'].strip(); final_nodes.append(node)
+    unique_edges_set = set(); unique_edges = []
     for edge in edges:
         if 'from' in edge and 'to' in edge:
             edge_key = (edge['from'], edge['to'], edge.get('label'))
-            # Check if edge_key is already added before appending
-            if edge_key not in unique_edges_set:
-                 unique_edges.append(edge)
-                 unique_edges_set.add(edge_key)
-        else:
-            logger.warning(f"[System] Skipping malformed edge: {edge}")
+            if edge_key not in unique_edges_set: unique_edges.append(edge); unique_edges_set.add(edge_key)
+        else: logger.warning(f"[System] Skipping malformed edge in graph_to_visjs: {edge}")
+
     return {"nodes": final_nodes, "edges": unique_edges}
 
 def process_turtle_data(turtle_data, sid):
