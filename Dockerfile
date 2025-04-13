@@ -4,8 +4,14 @@ FROM python:3.12-slim as builder
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies if needed (e.g., build tools if pip fails)
-# RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+# *** Install build dependencies ***
+# Install build-essential (for gcc, make, etc.) and libportaudio2 + dev headers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libportaudio2 \
+    libportaudiocpp0 \
+    portaudio19-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Prevent Python from writing pyc files
 ENV PYTHONDONTWRITEBYTECODE 1
@@ -15,7 +21,7 @@ ENV PYTHONUNBUFFERED 1
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt ./
 
-# Install Python dependencies
+# Install Python dependencies (PyAudio should build now)
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download NLTK data during the build
@@ -27,6 +33,12 @@ FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app
+
+# *** Install runtime dependencies (libportaudio2) ***
+# We only need the runtime library, not the dev headers or build tools, in the final image
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libportaudio2 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user and group
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
