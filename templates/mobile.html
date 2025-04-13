@@ -9,7 +9,32 @@
         body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
         #controls { padding: 15px; border-bottom: 1px solid #ccc; background-color: #f8f8f8; text-align: center; }
         #controls button { padding: 12px 20px; font-size: 1.1em; cursor: pointer; margin-right: 10px; border-radius: 5px;}
-        #status { margin-top: 8px; font-style: italic; min-height: 1.2em; font-size: 0.9em;}
+        /* Style for the volume meter */
+        #volumeMeterContainer {
+            height: 20px; /* Height of the meter */
+            width: 90%;  /* Width relative to controls */
+            max-width: 300px; /* Max width */
+            background-color: #e0e0e0;
+            border: 1px solid #ccc;
+            margin: 10px auto 5px auto; /* Center and space */
+            position: relative;
+            overflow: hidden;
+            border-radius: 3px;
+        }
+        #volumeLevel {
+            background-color: #4CAF50; /* Green bar */
+            height: 100%;
+            width: 0%; /* Start at 0 */
+            position: absolute;
+            left: 0;
+            top: 0;
+            transition: width 0.05s linear; /* Smooth transition */
+        }
+         /* Hide meter when not streaming */
+        #volumeMeterContainer.hidden {
+            display: none;
+        }
+        #status { margin-top: 0px; font-style: italic; min-height: 1.2em; font-size: 0.9em;}
         #query-section { flex-grow: 1; padding: 15px; display: flex; flex-direction: column; overflow-y: hidden; }
         #query-section h2 { margin-top: 0; text-align: center; }
         #queryInput { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 1em;}
@@ -17,7 +42,6 @@
         #queryResultContainer { flex-grow: 1; overflow-y: auto; margin-top: 15px; border: 1px solid #eee; border-radius: 5px;}
         #queryResult { white-space: pre-wrap; background-color: #f9f9f9; padding: 10px; min-height: 50px; }
         .error { color: red; font-weight: bold; }
-        /* Style for the generated links */
         #queryResult a { color: navy; text-decoration: underline; }
     </style>
 </head>
@@ -25,6 +49,10 @@
 
     <div id="controls">
         <button id="toggleAudioButton">Start Listening</button>
+        <!-- Add the volume meter elements -->
+        <div id="volumeMeterContainer" class="hidden">
+            <div id="volumeLevel"></div>
+        </div>
         <div id="status">Status: Disconnected</div>
     </div>
 
@@ -43,29 +71,33 @@
         const queryInput = document.getElementById('queryInput');
         const queryButton = document.getElementById('queryButton');
         const queryResultDiv = document.getElementById('queryResult');
+        // Get meter elements
+        const volumeMeterContainer = document.getElementById('volumeMeterContainer');
+        const volumeLevelDiv = document.getElementById('volumeLevel');
+
 
         // --- Config ---
-        const SERVER_URL = `${window.location.hostname}:${window.location.port}`;
+        const SERVER_URL = `http://${window.location.hostname}:${window.location.port}`;
         const TARGET_SAMPLE_RATE = 16000;
         const WORKLET_PROCESSOR_NAME = 'audio-processor';
         const WORKLET_PATH = '/static/audio-processor.js';
-        // Regex for likely CIDv1 (base32 - bafy... or bafk...)
-        // Adjust length check {50,} if needed, based on your CIDs
         const CID_REGEX = /baf[ky][a-z2-7]{50,}/gi;
-        // Choose your preferred IPFS gateway
-        const IPFS_GATEWAY = "https://gateway.lighthouse.storage/ipfs/"; // Or "https://ipfs.io/ipfs/"
+        const IPFS_GATEWAY = "https://gateway.lighthouse.storage/ipfs/";
 
         // --- State ---
         let socket = null;
         let audioContext = null;
         let microphoneNode = null;
         let audioWorkletNode = null;
+        let analyserNode = null; // For volume meter
+        let volumeDataArray = null; // To store volume data
+        let volumeAnimationId = null; // To control animation loop
         let isStreaming = false;
         let sourceStream = null;
 
         // --- Socket.IO Connection ---
+        // (connectSocket function remains the same)
         function connectSocket() {
-            // ... (keep existing connectSocket logic) ...
             if (socket && socket.connected) return;
             updateStatus("Connecting...");
             socket = io(SERVER_URL);
@@ -79,9 +111,7 @@
 
             socket.on('disconnect', (reason) => {
                 updateStatus(`Disconnected: ${reason}`, true);
-                if (isStreaming) {
-                    forceStopStreamingCleanup();
-                }
+                if (isStreaming) { forceStopStreamingCleanup(); }
                 toggleAudioButton.textContent = 'Start Listening';
                 toggleAudioButton.disabled = true;
                 queryButton.disabled = true;
@@ -99,44 +129,32 @@
                 updateStatus(`Server error: ${data.message}`, true);
             });
 
-             // Listen for query results
-            socket.on('query_result', (data) => {
+             socket.on('query_result', (data) => {
                 console.log("Query result:", data);
-                queryButton.disabled = false; // Re-enable button
-                queryInput.disabled = false;
-                queryResultDiv.classList.remove('error'); // Clear previous errors
-
-                if (data.processing) {
-                    queryResultDiv.textContent = data.answer; // Display processing message as text
-                 } else if (data.error || !data.answer) {
-                    queryResultDiv.textContent = `Error: ${data.answer || 'Empty response from server'}`; // Display errors as text
-                    queryResultDiv.classList.add('error');
-                } else {
-                    // *** NEW LOGIC: Set text, then linkify CIDs ***
-                    const rawAnswer = data.answer;
-                    // 1. Set the raw text content first (safer)
-                    queryResultDiv.textContent = rawAnswer;
-
-                    // 2. Find CIDs in the raw text and replace them in the displayed HTML
-                    // We need to use innerHTML for the replacement part
-                    let currentHtml = queryResultDiv.innerHTML; // Get HTML representation of the text just set
+                queryButton.disabled = false; queryInput.disabled = false;
+                queryResultDiv.classList.remove('error');
+                if (data.processing) { queryResultDiv.textContent = data.answer; }
+                else if (data.error || !data.answer) { queryResultDiv.textContent = `Error: ${data.answer || 'Empty response'}`; queryResultDiv.classList.add('error'); }
+                else {
+                    const rawAnswer = data.answer; queryResultDiv.textContent = rawAnswer;
+                    let currentHtml = queryResultDiv.innerHTML;
                     const updatedHtml = currentHtml.replace(CID_REGEX, (cid) => {
                         const linkUrl = `${IPFS_GATEWAY}${cid}`;
-                        // Create the link HTML string
                         return `<a href="${linkUrl}" target="_blank" rel="noopener noreferrer">${cid}</a>`;
                     });
-
-                    // 3. Update the div's content with the HTML containing links
                     queryResultDiv.innerHTML = updatedHtml;
                 }
             });
 
-            // Listen for server confirmation of start/stop
              socket.on('audio_started', () => {
                 if (!isStreaming) { console.log("Ignoring stale audio_started"); return; }
                 updateStatus("Streaming audio...");
                 toggleAudioButton.textContent = 'Stop Listening';
                 toggleAudioButton.disabled = false;
+                // *** Show volume meter ***
+                volumeMeterContainer.classList.remove('hidden');
+                // *** Start volume animation ***
+                drawVolumeMeter();
             });
 
             socket.on('audio_stopped', (data) => {
@@ -145,11 +163,14 @@
                  if (isStreaming) { forceStopStreamingCleanup(); }
                 toggleAudioButton.textContent = 'Start Listening';
                 toggleAudioButton.disabled = !(socket && socket.connected);
+                 // *** Hide volume meter ***
+                 volumeMeterContainer.classList.add('hidden');
+                 // Ensure animation stops if not already stopped
+                 if (volumeAnimationId) { cancelAnimationFrame(volumeAnimationId); volumeAnimationId = null; }
             });
         }
 
         // --- Audio Processing ---
-        // (Keep startStreaming, stopStreaming, forceStopStreamingCleanup as before)
         async function startStreaming() {
              if (isStreaming || !socket || !socket.connected) return;
              updateStatus("Initializing audio...");
@@ -159,36 +180,96 @@
                  if (audioContext.state === 'suspended') await audioContext.resume();
                  if (!audioContext.audioWorklet) { updateStatus("Error: AudioWorklet unavailable (HTTPS required).", true); toggleAudioButton.disabled = false; return; }
                  try { await audioContext.audioWorklet.addModule(WORKLET_PATH); } catch (e) { updateStatus(`Error: Could not load audio processor. ${e.message}`, true); toggleAudioButton.disabled = false; return; }
+
                  sourceStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: TARGET_SAMPLE_RATE } });
                  microphoneNode = audioContext.createMediaStreamSource(sourceStream);
                  audioWorkletNode = new AudioWorkletNode(audioContext, WORKLET_PROCESSOR_NAME);
+
+                 // *** Create and configure AnalyserNode ***
+                 analyserNode = audioContext.createAnalyser();
+                 analyserNode.fftSize = 256; // Smaller size for faster processing, adjust as needed
+                 const bufferLength = analyserNode.frequencyBinCount;
+                 volumeDataArray = new Uint8Array(bufferLength); // Use time domain data
+                 console.log("AnalyserNode created with bufferLength:", bufferLength);
+
                  audioWorkletNode.port.onmessage = (event) => { if (socket && socket.connected && isStreaming) socket.emit('audio_chunk', event.data); };
                  audioWorkletNode.port.onerror = (event) => { updateStatus(`Audio processing error: ${event.message || 'Unknown'}`, true); stopStreaming(); };
+
+                 // Connect mic -> worklet -> destination
                  microphoneNode.connect(audioWorkletNode);
                  audioWorkletNode.connect(audioContext.destination);
+                 // *** Connect mic -> analyser as well ***
+                 microphoneNode.connect(analyserNode);
+                 // Analyser output doesn't need to go anywhere
+
                  socket.emit('start_audio');
                  isStreaming = true;
                  updateStatus("Waiting for server confirmation...");
              } catch (err) { updateStatus(`Error: ${err.message}`, true); forceStopStreamingCleanup(); toggleAudioButton.disabled = !(socket && socket.connected); }
          }
+
         function stopStreaming() {
              if (!isStreaming) return;
              console.log("User requested stop.");
-             isStreaming = false;
+             isStreaming = false; // Set immediately
              if (socket && socket.connected) socket.emit('stop_audio');
-             forceStopStreamingCleanup();
+             forceStopStreamingCleanup(); // Local cleanup
              toggleAudioButton.textContent = 'Start Listening';
              updateStatus("Stopped listening.");
              toggleAudioButton.disabled = !(socket && socket.connected);
-         }
+             // Hiding meter happens in 'audio_stopped' handler or forceStopStreamingCleanup
+        }
+
         function forceStopStreamingCleanup() {
              console.log("Cleaning up audio resources...");
-             isStreaming = false;
-             if (audioWorkletNode) { audioWorkletNode.port.onmessage = null; audioWorkletNode.port.onerror = null; try { audioWorkletNode.disconnect(); } catch(e){} audioWorkletNode = null; }
-             if (microphoneNode) { try { microphoneNode.disconnect(); } catch(e){} microphoneNode = null; }
-             if (sourceStream) { sourceStream.getTracks().forEach(track => track.stop()); sourceStream = null; console.log("Mic stream tracks stopped."); }
+             isStreaming = false; // Ensure flag is false
+
+             // *** Cancel volume animation ***
+             if (volumeAnimationId) {
+                 cancelAnimationFrame(volumeAnimationId);
+                 volumeAnimationId = null;
+                 console.log("Volume animation cancelled.");
+             }
+              // *** Hide and reset volume meter ***
+             volumeMeterContainer.classList.add('hidden');
+             volumeLevelDiv.style.width = '0%';
+
+
+             if (audioWorkletNode) { audioWorkletNode.port.onmessage = null; audioWorkletNode.port.onerror = null; try { audioWorkletNode.disconnect(); } catch(e){} audioWorkletNode = null; console.log("Worklet disconnected."); }
+             if (analyserNode) { try { analyserNode.disconnect(); } catch(e){} analyserNode = null; console.log("Analyser disconnected."); } // *** Disconnect analyser ***
+             if (microphoneNode) { try { microphoneNode.disconnect(); } catch(e){} microphoneNode = null; console.log("Mic node disconnected."); }
+             if (sourceStream) { sourceStream.getTracks().forEach(track => track.stop()); sourceStream = null; console.log("Mic stream stopped."); }
+
              console.log("Audio cleanup finished.");
         }
+
+        // --- NEW: Volume Meter Drawing Function ---
+        function drawVolumeMeter() {
+            // Request the next frame
+            volumeAnimationId = requestAnimationFrame(drawVolumeMeter);
+
+            if (!analyserNode || !volumeDataArray) return;
+
+            // Get time domain data
+            analyserNode.getByteTimeDomainData(volumeDataArray);
+
+            // Calculate a simple volume metric (e.g., max deviation from midpoint)
+            let maxVal = 0;
+            for (let i = 0; i < volumeDataArray.length; i++) {
+                // Values are 0-255, midpoint is 128
+                const deviation = Math.abs(volumeDataArray[i] - 128);
+                if (deviation > maxVal) {
+                    maxVal = deviation;
+                }
+            }
+
+            // Normalize maxVal (0-128) to a percentage (0-100)
+            const volumePercent = (maxVal / 128) * 100;
+
+            // Update the width of the volume level div
+            volumeLevelDiv.style.width = volumePercent + '%';
+        }
+
 
         // --- Query Handling ---
         // (Keep sendQuery as before)
