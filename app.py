@@ -107,28 +107,33 @@ query_chat = None
 # --- System Prompts (Modified for CID in user message) ---
 quick_llm_system_prompt = """
 You will convert transcribed speech into an RDF knowledge graph using Turtle syntax.
-**IMPORTANT: The user's message will include a CID at the start**
-You MUST extract the `<CID_STRING>` from the beginning of the user's message.
+IMPORTANT: The user's message will include a CID at the start
+You MUST extract the <CID_STRING> from the beginning of the user's message.
 
-Return only the new RDF Turtle triples representing entities and relationships mentioned in the **Transcription Text** part.
-Use the 'ex:' prefix for examples (e.g., <http://example.org/>).
+Return only the new RDF Turtle triples representing entities and relationships mentioned in the Transcription Text part. Use the 'ex:' prefix for examples (e.g., http://example.org/).
 
 Follow these steps:
+
 1. Identify the Source CID provided at the beginning of the user's message.
-2. Identify entities (people, places, concepts, times, organizations, etc.).
-3. Create URIs for entities using the ex: prefix and CamelCase (e.g., ex:EntityName). Use existing URIs if entities are mentioned again.
-4. Identify relationships between entities (e.g., ex:worksAt, ex:locatedIn, ex:discussedConcept).
-5. Identify properties of entities (e.g., rdfs:label, ex:hasValue, ex:occurredOnDate). Use appropriate datatypes for literals (e.g., "value"^^xsd:string, "123"^^xsd:integer, "2024-01-01"^^xsd:date).
-6. Create URIs and properties as usual (e.g., `ex:Alice a ex:Person`).
-7. **Crucially:** For significant entities or statements derived *directly* from the Transcription Text, add a triple linking them back to the **Source CID you extracted** using the `ex:sourceTranscriptionCID` predicate. Example:
-   `ex:Alice ex:sourceTranscriptionCID "<EXTRACTED_CID_STRING>"^^xsd:string .`
-   `ex:ProjectPhoenix ex:sourceTranscriptionCID "<EXTRACTED_CID_STRING>"^^xsd:string .`
-8. Format as valid Turtle triples. Output ONLY Turtle syntax. Do not repeat triples.
+2. Identify the full Transcription Text after the Source CID.
+3. Create a new transcription node using a URI that incorporates the extracted CID (e.g., ex:transcription_<CID_STRING>).
+   This transcription node MUST include:
+   - The property ex:sourceTranscriptionCID with the extracted <CID_STRING> (typed as an xsd:string).
+   - The property ex:transcriptionText containing the full transcription text.
 
-Example Input User Message:
-Source CID: bafy...xyz
+4. Identify entities (people, places, concepts, times, organizations, etc.) within the transcription.
+5. Create URIs for entities using the ex: prefix and CamelCase (e.g., ex:EntityName). Use existing URIs if the same entities are mentioned again.
+6. Identify relationships between entities (e.g., ex:worksAt, ex:locatedIn, ex:discussedConcept).
+7. Identify properties of entities (e.g., rdfs:label, ex:hasValue, ex:occurredOnDate). Use appropriate datatypes for literals (e.g., "value"^^xsd:string, "123"^^xsd:integer, "2024-01-01"^^xsd:date).
+8. For significant entities or statements derived directly from the Transcription Text, do not attach the CID directly. Instead, add a triple linking them to the transcription node using a relation such as ex:derivedFromTranscript.
 
-Transcription Text: Acme Corporation announced Project Phoenix. Alice Johnson leads it.
+Example:
+ex:AliceJohnson ex:derivedFromTranscript ex:transcription_<CID_STRING> .
+ex:ProjectPhoenix ex:derivedFromTranscript ex:transcription_<CID_STRING> .
+
+Format your output as valid Turtle triples. Output ONLY Turtle syntax and do not repeat triples.
+
+Example Input User Message: [bafy...xyz] Acme Corporation announced Project Phoenix. Alice Johnson leads it.
 
 Example Output Format:
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -136,17 +141,21 @@ Example Output Format:
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
+ex:transcription_bafy_xyz a ex:Transcription ;
+    ex:sourceTranscriptionCID "bafy...xyz"^^xsd:string ;
+    ex:transcriptionText "Acme Corporation announced Project Phoenix. Alice Johnson leads it." .
+
 ex:AcmeCorporation a ex:Organization ;
     ex:announcedProject ex:ProjectPhoenix ;
-    ex:sourceTranscriptionCID "bafy...xyz"^^xsd:string .
+    ex:derivedFromTranscript ex:transcription_bafy_xyz .
 
 ex:ProjectPhoenix a ex:Project ;
     rdfs:label "Phoenix"^^xsd:string ;
     ex:ledBy ex:AliceJohnson ;
-    ex:sourceTranscriptionCID "bafy...xyz"^^xsd:string .
+    ex:derivedFromTranscript ex:transcription_bafy_xyz .
 
 ex:AliceJohnson a ex:Person ;
-    ex:sourceTranscriptionCID "bafy...xyz"^^xsd:string .
+    ex:derivedFromTranscript ex:transcription_bafy_xyz .
 """
 
 slow_llm_system_prompt = """
@@ -440,15 +449,7 @@ def process_with_quick_llm(text_chunk, sid, transcription_cid=None):
         socketio.emit('error', {'message': 'RDF generation service unavailable.'}, room=sid)
         return
 
-    # Construct user message with CID prefix
-    if transcription_cid:
-        cid_prefix = f"Source CID: {transcription_cid}\n\nTranscription Text: "
-    else:
-        cid_prefix = "Transcription Text: " # No CID available
-        logger.warning(f"{log_prefix} Processing Quick LLM without source CID for text: '{text_chunk[:50]}...'")
-
     user_message = f"[{transcription_cid}] {text_chunk}"
-    #user_message = text_chunk
 
     logger.info(f"{log_prefix} Processing with Quick LLM (CID: {transcription_cid}): '{text_chunk[:100]}...'")
 
