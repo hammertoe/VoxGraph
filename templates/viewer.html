@@ -114,7 +114,7 @@
         const provenanceToggle = document.getElementById('provenanceToggle'); // Get the toggle switch
 
         // --- Config ---
-        const SERVER_URL = `http://${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
         const PROVENANCE_NODE_GROUP = "Transcription"; // Group name assigned by backend
         const PROVENANCE_EDGE_LABEL = "sourceTranscriptionCID"; // Edge label assigned by backend
 
