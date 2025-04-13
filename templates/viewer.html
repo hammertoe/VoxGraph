@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoxGraph - Graph Viewer</title>
+    <!-- Include Socket.IO client library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <!-- Include Vis.js for graph visualization -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+    <style>
+        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: sans-serif;}
+        #graph-container { width: 100%; height: calc(100% - 25px); /* Account for status bar */ border: none; }
+        #mynetwork { width: 100%; height: 100%; border: none; }
+        #status { padding: 5px; font-size: 0.9em; background-color: #f0f0f0; border-top: 1px solid #ccc; position: fixed; bottom: 0; width: 100%; text-align: center; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="graph-container">
+        <div id="mynetwork"></div>
+    </div>
+    <div id="status">Status: Connecting...</div>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const networkContainer = document.getElementById('mynetwork');
+
+        // --- Config ---
+        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+
+        // --- State ---
+        let socket = null;
+
+        // --- Vis.js Graph Setup ---
+        let network = null;
+        const nodes = new vis.DataSet([]);
+        const edges = new vis.DataSet([]);
+        const graphData = { nodes: nodes, edges: edges };
+        const graphOptions = {
+            nodes: {
+                shape: 'dot',
+                size: 16,
+                font: { size: 12, color: '#000000' },
+                borderWidth: 2
+            },
+            edges: {
+                width: 2,
+                arrows: 'to',
+                font: { align: 'horizontal', middle: true, size: 10 }
+            },
+            physics: {
+                 barnesHut: { gravitationalConstant: -8000, springConstant: 0.04, springLength: 150 }
+            },
+             groups: { // Example groups for styling
+                 Person: { color:{background:'lightblue', border:'blue'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf007', size: 50, color: 'blue'} },
+                 Organization: { color:{background:'lightgreen', border:'green'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf1ad', size: 50, color: 'green'} },
+                 Project: { color:{background:'lightcoral', border:'red'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf0b1', size: 50, color: 'red'} },
+                 Instance: { color: { background: '#CCCCCC', border: '#AAAAAA' } } // Default
+             }
+        };
+
+        function initializeGraph() {
+            network = new vis.Network(networkContainer, graphData, graphOptions);
+            console.log("Vis.js Network initialized.");
+        }
+
+        function updateGraph(data) {
+            console.log("Received graph update:", data);
+            try {
+                const receivedNodeIds = new Set(data.nodes.map(n => n.id));
+                const nodesToRemove = nodes.getIds().filter(id => !receivedNodeIds.has(id));
+                if (nodesToRemove.length > 0) nodes.remove(nodesToRemove);
+
+                const edgesWithGeneratedIds = data.edges.map((e, index) => ({
+                     id: e.id || `${e.from}-${e.to}-${e.label || index}`, ...e }));
+                const receivedEdgeIds = new Set(edgesWithGeneratedIds.map(e => e.id));
+                const edgesToRemove = edges.getIds().filter(id => !receivedEdgeIds.has(id));
+                 // Also remove edges connected to removed nodes (more robustly)
+                 edges.get({filter: edge => nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to)})
+                      .forEach(edge => { if (!edgesToRemove.includes(edge.id)) edgesToRemove.push(edge.id);});
+                if (edgesToRemove.length > 0) edges.remove(edgesToRemove);
+
+                nodes.update(data.nodes);
+                edges.update(edgesWithGeneratedIds);
+
+            } catch (error) {
+                console.error("Error updating graph:", error);
+                updateStatus(`Error updating graph: ${error.message}`, true);
+            }
+        }
+
+        // --- Socket.IO Connection ---
+        function connectSocket() {
+            if (socket && socket.connected) return;
+            updateStatus("Connecting to server...");
+            socket = io(SERVER_URL);
+
+            socket.on('connect', () => {
+                updateStatus("Connected to server. Waiting for graph updates.");
+            });
+
+            socket.on('disconnect', (reason) => {
+                updateStatus(`Disconnected: ${reason}`, true);
+            });
+
+            socket.on('connect_error', (err) => {
+                updateStatus(`Connection error: ${err.message}`, true);
+            });
+
+            socket.on('error', (data) => { // Listen for general server errors
+                updateStatus(`Server error: ${data.message}`, true);
+            });
+
+            // Listen ONLY for graph updates
+            socket.on('update_graph', (data) => {
+                if (network) {
+                    updateGraph(data);
+                } else {
+                    console.warn("Received graph update but network not initialized yet.");
+                }
+            });
+        }
+
+        function updateStatus(message, isError = false) {
+            console.log(`Status: ${message}`);
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = isError ? 'error' : '';
+        }
+
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeGraph();
+            connectSocket();
+        });
+
+        // Clean up on page leave
+        window.addEventListener('beforeunload', () => {
+            if (socket) {
+                socket.disconnect();
+            }
+        });
+
+    </script>
+</body>
+</html>

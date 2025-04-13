@@ -802,9 +802,17 @@ def handle_query_graph(data):
 # --- Flask Routes ---
 @app.route('/')
 def index():
-    """Serves the main HTML page for the web interface."""
-    logger.info("[System] Serving index.html") # Manual prefix
-    return render_template('index.html')
+    """Serves the main GRAPH VIEWER page."""
+    logger.info("[System] Serving viewer.html (for /)")
+    # Rename your original index.html to viewer.html in the templates folder
+    return render_template('viewer.html')
+
+@app.route('/mobile')
+def mobile():
+    """Serves the MOBILE INTERFACE page."""
+    logger.info("[System] Serving mobile.html (for /mobile)")
+    # Create a new mobile.html file in the templates folder
+    return render_template('mobile.html')
 
 # --- Main Execution ---
 if __name__ == '__main__':

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- Make it mobile friendly -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>VoxGraph - Mobile Input</title>
+    <!-- Include Socket.IO client library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
+        #controls { padding: 15px; border-bottom: 1px solid #ccc; background-color: #f8f8f8; text-align: center; }
+        #controls button { padding: 12px 20px; font-size: 1.1em; cursor: pointer; margin-right: 10px; border-radius: 5px;}
+        #status { margin-top: 8px; font-style: italic; min-height: 1.2em; font-size: 0.9em;}
+        #query-section { flex-grow: 1; padding: 15px; display: flex; flex-direction: column; overflow-y: hidden; /* Prevent body scroll */}
+        #query-section h2 { margin-top: 0; text-align: center; }
+        #queryInput { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 1em;}
+        #queryButton { padding: 10px 15px; width: 100%; font-size: 1em; border-radius: 5px; background-color: #4CAF50; color: white; border: none;}
+        #queryResultContainer { flex-grow: 1; overflow-y: auto; margin-top: 15px; border: 1px solid #eee; border-radius: 5px;} /* Make result scrollable */
+        #queryResult { white-space: pre-wrap; background-color: #f9f9f9; padding: 10px; min-height: 50px; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <button id="toggleAudioButton">Start Listening</button>
+        <div id="status">Status: Disconnected</div>
+    </div>
+
+    <div id="query-section">
+        <h2>Query Knowledge Graph</h2>
+        <input type="text" id="queryInput" placeholder="Enter your query...">
+        <button id="queryButton">Ask</button>
+        <div id="queryResultContainer">
+             <div id="queryResult">Query results will appear here.</div>
+        </div>
+    </div>
+
+    <script>
+        const toggleAudioButton = document.getElementById('toggleAudioButton');
+        const statusDiv = document.getElementById('status');
+        const queryInput = document.getElementById('queryInput');
+        const queryButton = document.getElementById('queryButton');
+        const queryResultDiv = document.getElementById('queryResult');
+
+        // --- Config ---
+        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+        const TARGET_SAMPLE_RATE = 16000; // Must match backend
+        const WORKLET_PROCESSOR_NAME = 'audio-processor';
+        // Ensure this path is correct relative to how Flask serves static files
+        const WORKLET_PATH = '/static/audio-processor.js';
+
+        // --- State ---
+        let socket = null;
+        let audioContext = null;
+        let microphoneNode = null;
+        let audioWorkletNode = null;
+        let isStreaming = false;
+        let sourceStream = null; // Keep track of the raw stream to stop tracks
+
+        // --- Socket.IO Connection ---
+        function connectSocket() {
+            if (socket && socket.connected) return;
+            updateStatus("Connecting...");
+            socket = io(SERVER_URL);
+
+            socket.on('connect', () => {
+                updateStatus("Connected. Ready.");
+                toggleAudioButton.disabled = false;
+                queryButton.disabled = false;
+                queryInput.disabled = false;
+            });
+
+            socket.on('disconnect', (reason) => {
+                updateStatus(`Disconnected: ${reason}`, true);
+                if (isStreaming) {
+                    // Force cleanup if disconnected while streaming
+                    forceStopStreamingCleanup();
+                }
+                toggleAudioButton.textContent = 'Start Listening';
+                toggleAudioButton.disabled = true;
+                queryButton.disabled = true;
+                queryInput.disabled = true;
+            });
+
+            socket.on('connect_error', (err) => {
+                updateStatus(`Connection error: ${err.message}`, true);
+                toggleAudioButton.disabled = true;
+                queryButton.disabled = true;
+                queryInput.disabled = true;
+            });
+
+            socket.on('error', (data) => {
+                updateStatus(`Server error: ${data.message}`, true);
+                // Optional: stop streaming on certain errors
+                // if (isStreaming && data.message.includes("Critical")) {
+                //     stopStreaming();
+                // }
+            });
+
+             // Listen for query results
+            socket.on('query_result', (data) => {
+                console.log("Query result:", data);
+                if (data.processing) {
+                    queryResultDiv.textContent = data.answer;
+                    queryResultDiv.classList.remove('error');
+                 } else if (data.error) {
+                    queryResultDiv.textContent = `Error: ${data.answer}`;
+                    queryResultDiv.classList.add('error');
+                } else {
+                    queryResultDiv.textContent = data.answer;
+                    queryResultDiv.classList.remove('error');
+                }
+                queryButton.disabled = false; // Re-enable button
+                queryInput.disabled = false;
+            });
+
+            // Listen for server confirmation of start/stop
+             socket.on('audio_started', () => {
+                if (!isStreaming) { // Avoid race conditions if user clicked stop quickly
+                    console.log("Received audio_started but no longer streaming locally.");
+                    // Ask server to stop again? Or just ignore.
+                    return;
+                }
+                updateStatus("Streaming audio...");
+                toggleAudioButton.textContent = 'Stop Listening';
+                toggleAudioButton.disabled = false; // Ensure enabled
+            });
+
+            socket.on('audio_stopped', (data) => {
+                const reason = data?.message || "Server initiated stop";
+                updateStatus(`Stopped: ${reason}`);
+                 // Ensure local state matches server state
+                 if (isStreaming) {
+                     forceStopStreamingCleanup(); // Clean up audio resources
+                 }
+                toggleAudioButton.textContent = 'Start Listening';
+                toggleAudioButton.disabled = !(socket && socket.connected);
+            });
+        }
+
+        // --- Audio Processing ---
+        async function startStreaming() {
+            if (isStreaming || !socket || !socket.connected) {
+                console.log("Cannot start: Not connected or already streaming.");
+                return;
+            }
+            updateStatus("Initializing audio...");
+            toggleAudioButton.disabled = true; // Disable while starting
+
+            try {
+                 // Create or resume AudioContext on user interaction
+                 if (!audioContext || audioContext.state === 'closed') {
+                     console.log("Creating new AudioContext");
+                     audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+                 }
+                 if (audioContext.state === 'suspended') {
+                     console.log("Resuming AudioContext");
+                     await audioContext.resume();
+                 }
+
+                 if (!audioContext.audioWorklet) {
+                     const errorMsg = "Error: AudioWorklet API unavailable. Requires secure context (HTTPS or localhost).";
+                     console.error(errorMsg, "Is Secure Context:", window.isSecureContext);
+                     updateStatus(errorMsg, true);
+                     toggleAudioButton.disabled = false;
+                     return;
+                 }
+
+                // Load the AudioWorklet processor
+                try {
+                    console.log(`Adding AudioWorklet module from ${WORKLET_PATH}`);
+                    await audioContext.audioWorklet.addModule(WORKLET_PATH);
+                    console.log("AudioWorklet module added.");
+                } catch (e) {
+                     console.error(`Failed to load AudioWorklet module:`, e);
+                     updateStatus(`Error: Could not load audio processor. ${e.message}`, true);
+                     toggleAudioButton.disabled = false;
+                     return;
+                }
+
+                // Get microphone input
+                console.log("Requesting microphone access...");
+                sourceStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: TARGET_SAMPLE_RATE
+                    }
+                });
+                console.log("Microphone access granted.");
+
+                microphoneNode = audioContext.createMediaStreamSource(sourceStream);
+
+                // Create the AudioWorklet node
+                audioWorkletNode = new AudioWorkletNode(audioContext, WORKLET_PROCESSOR_NAME);
+                console.log("AudioWorkletNode created.");
+
+                // Handle messages (audio buffers) from the worklet
+                audioWorkletNode.port.onmessage = (event) => {
+                    if (socket && socket.connected && isStreaming) {
+                        socket.emit('audio_chunk', event.data);
+                    }
+                };
+                 audioWorkletNode.port.onerror = (event) => {
+                     console.error("Error from AudioWorklet:", event);
+                     updateStatus(`Audio processing error: ${event.message || 'Unknown'}`, true);
+                     stopStreaming(); // Stop on worklet error
+                 };
+
+                // Connect the microphone to the worklet, and worklet to destination
+                microphoneNode.connect(audioWorkletNode);
+                audioWorkletNode.connect(audioContext.destination);
+                console.log("Audio nodes connected.");
+
+                // Signal the backend to prepare for audio
+                console.log("Signalling server: start_audio");
+                socket.emit('start_audio');
+                isStreaming = true; // Set flag *after* signalling server
+                // UI update happens on 'audio_started' confirmation from server
+                updateStatus("Waiting for server confirmation...");
+
+
+            } catch (err) {
+                console.error("Error starting audio stream:", err);
+                updateStatus(`Error: ${err.message}`, true);
+                forceStopStreamingCleanup(); // Clean up any partial setup
+                toggleAudioButton.disabled = !(socket && socket.connected);
+            }
+        }
+
+        function stopStreaming() {
+            if (!isStreaming) {
+                console.log("Already stopped.");
+                return;
+            }
+            console.log("User requested stop. Signalling server...");
+            isStreaming = false; // Set flag immediately
+
+            if (socket && socket.connected) {
+                socket.emit('stop_audio'); // Inform the backend
+            }
+            // Do local cleanup *now* as well, don't wait for confirmation
+            forceStopStreamingCleanup();
+            toggleAudioButton.textContent = 'Start Listening';
+            updateStatus("Stopped listening."); // Update UI immediately
+            toggleAudioButton.disabled = !(socket && socket.connected);
+        }
+
+        // Separate cleanup function to be called on stop or unexpected disconnect
+        function forceStopStreamingCleanup() {
+             console.log("Cleaning up audio resources...");
+             isStreaming = false; // Ensure flag is false
+
+             if (audioWorkletNode) {
+                audioWorkletNode.port.onmessage = null;
+                 audioWorkletNode.port.onerror = null;
+                try { audioWorkletNode.disconnect(); } catch (e) {} // Ignore errors on disconnect
+                audioWorkletNode = null;
+                console.log("AudioWorkletNode disconnected.");
+            }
+            if (microphoneNode) {
+                 try { microphoneNode.disconnect(); } catch (e) {} // Ignore errors on disconnect
+                 microphoneNode = null;
+                 console.log("MicrophoneNode disconnected.");
+            }
+             // Stop the tracks of the original stream to release the mic
+             if (sourceStream) {
+                 sourceStream.getTracks().forEach(track => track.stop());
+                 console.log("Microphone stream tracks stopped.");
+                 sourceStream = null;
+             }
+             // Don't close the audio context, allow potential restart
+            // if (audioContext && audioContext.state !== 'closed') {
+            //     audioContext.suspend(); // Suspend instead of close?
+            // }
+            console.log("Audio cleanup finished.");
+        }
+
+
+        // --- Query Handling ---
+        function sendQuery() {
+            const query = queryInput.value.trim();
+            if (!query) {
+                queryResultDiv.textContent = "Please enter a query.";
+                queryResultDiv.classList.add('error');
+                return;
+            }
+            if (!socket || !socket.connected) {
+                queryResultDiv.textContent = "Not connected to the server.";
+                queryResultDiv.classList.add('error');
+                return;
+            }
+
+            console.log("Sending query:", query);
+            queryResultDiv.textContent = "Sending query...";
+            queryResultDiv.classList.remove('error');
+            queryButton.disabled = true; // Disable while processing
+            queryInput.disabled = true;
+            socket.emit('query_graph', { query: query });
+        }
+
+        function updateStatus(message, isError = false) {
+            console.log(`Status: ${message}`);
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = isError ? 'error' : '';
+        }
+
+
+        // --- Event Listeners ---
+        toggleAudioButton.addEventListener('click', () => {
+            if (!isStreaming) {
+                startStreaming();
+            } else {
+                stopStreaming();
+            }
+        });
+
+        queryButton.addEventListener('click', sendQuery);
+        queryInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault(); // Prevent potential form submission
+                sendQuery();
+            }
+        });
+
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            connectSocket();
+            toggleAudioButton.disabled = true; // Disabled until connected
+            queryButton.disabled = true;
+            queryInput.disabled = true;
+        });
+
+        // Clean up on page leave
+        window.addEventListener('beforeunload', () => {
+             // Don't call stopStreaming here as it emits - disconnect is better
+            if (socket) {
+                socket.disconnect();
+            }
+        });
+
+    </script>
+</body>
+</html>
