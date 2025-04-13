@@ -4,7 +4,7 @@ flask-socketio>=5.2.0
 eventlet>=0.33.3
 python-dotenv>=0.20.0
 google-api-core>=2.24.2
-google-genai
+google-genai==1.9.0
 rdflib>=6.2.0
 numpy>=1.22.0
 nltk>=3.7
