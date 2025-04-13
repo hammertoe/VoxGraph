@@ -1,301 +1,433 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Knowledge Graph Visualization & Query</title>
-    <!-- Vis.js CSS -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoxGraph - Live Audio</title>
+    <!-- Include Socket.IO client library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <!-- Include Vis.js for graph visualization -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
-    <!-- Bootstrap for responsive layout -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        html, body {
-            height: 100%;
-            margin: 0;
-            padding: 0;
-            overflow: hidden;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f8f9fa;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .navbar {
-            background-color: #343a40;
-            padding: 0.5rem 1rem;
-            flex-shrink: 0;
-            z-index: 10;
-        }
-
-        .navbar .navbar-brand {
-             color: white !important;
-        }
-
-        .main-content-area {
-            padding: 20px;
-            flex-grow: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden; /* Hide overflow for the main area */
-            min-height: 0;
-        }
-
-        /* The row containing graph and query */
-        .content-row {
-            flex-grow: 1; /* Allow row to take vertical space */
-            min-height: 0; /* Important for children height % */
-            display: flex; /* Use flex for row content */
-        }
-
-        /* Columns within the row */
-        .graph-column {
-             /* Use Bootstrap's col-md-8 */
-             height: 100%; /* Fill the row height */
-             display: flex; /* Make it a flex container */
-             flex-direction: column; /* Stack elements inside if needed */
-        }
-        .query-column {
-            /* Use Bootstrap's col-md-4 */
-            height: 100%; /* Fill the row height */
-            display: flex; /* Make it a flex container */
-            flex-direction: column; /* Stack card elements inside */
-            padding-left: 15px; /* Add some space between columns */
-        }
-
-        #graph-container {
-            width: 100%;
-            height: 100%; /* Fill parent column (.graph-column) */
-            border: 1px solid #dee2e6;
-            border-radius: 4px;
-            background-color: white;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-
-        .query-section {
-             /* Let the card fill the query column */
-             display: flex;
-             flex-direction: column;
-             height: 100%; /* Fill the column */
-             overflow: hidden; /* Prevent card content from overflowing column */
-        }
-
-        .query-section .card {
-            flex-grow: 1; /* Allow card to grow */
-            display: flex;
-            flex-direction: column;
-            border-radius: 4px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-
-        .query-section .card-header {
-            background-color: #f1f3f5;
-            font-weight: bold;
-            flex-shrink: 0; /* Prevent header shrinking */
-        }
-
-        .query-section .card-body {
-            flex-grow: 1; /* Allow body to take space */
-            overflow-y: auto; /* Allow scrolling within card body */
-            display: flex;
-            flex-direction: column;
-        }
-
-        #query-result {
-            min-height: 60px;
-            /* Removed max-height to let it grow within card-body */
-            border: 1px solid #dee2e6;
-            padding: 10px;
-            background-color: white;
-            border-radius: 4px;
-            margin-top: 10px;
-            white-space: pre-wrap;
-            flex-grow: 1; /* Allow result area to expand */
-            overflow-y: auto; /* Scroll specifically within results */
-        }
-
-        .status-bar {
-            padding: 10px;
-            border-radius: 4px;
-            flex-shrink: 0;
-            margin-top: 15px; /* Space above status bar */
-            /* Removed sticky positioning */
-        }
-
-        .info {
-            background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb;
-        }
-        .error {
-            background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;
-        }
-        .form-group { margin-bottom: 15px; }
-        .form-control { border-radius: 4px; }
-        .btn-primary { background-color: #0d6efd; border-color: #0d6efd; }
-
+        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
+        #controls { padding: 15px; border-bottom: 1px solid #ccc; background-color: #f8f8f8; }
+        #controls button { padding: 8px 15px; font-size: 1em; cursor: pointer; margin-right: 10px; }
+        #status { margin-top: 5px; font-style: italic; min-height: 1.2em; }
+        #main-content { display: flex; flex-grow: 1; overflow: hidden; }
+        #graph-container { flex: 2; border-right: 1px solid #ccc; height: 100%; }
+        #mynetwork { width: 100%; height: 100%; border: none; } /* Ensure graph fills container */
+        #query-section { flex: 1; padding: 15px; display: flex; flex-direction: column; overflow-y: auto; }
+        #query-section h2 { margin-top: 0; }
+        #queryInput { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; }
+        #queryButton { padding: 10px 15px; }
+        #queryResult { margin-top: 15px; white-space: pre-wrap; background-color: #eee; padding: 10px; border-radius: 5px; flex-grow: 1; overflow-y: auto; }
+        .error { color: red; font-weight: bold; }
     </style>
 </head>
 <body>
-    <nav class="navbar">
-        <div class="container">
-            <span class="navbar-brand mb-0 h1">Knowledge Graph Visualization & Query</span>
+
+    <div id="controls">
+        <button id="toggleAudioButton">Start Listening</button>
+        <div id="status">Status: Disconnected</div>
+    </div>
+
+    <div id="main-content">
+        <div id="graph-container">
+            <div id="mynetwork"></div>
         </div>
-    </nav>
+        <div id="query-section">
+            <h2>Query Knowledge Graph</h2>
+            <input type="text" id="queryInput" placeholder="Enter your query...">
+            <button id="queryButton">Ask</button>
+            <div id="queryResult">Query results will appear here.</div>
+        </div>
+    </div>
 
-    <div class="main-content-area">
-        <!-- Row containing graph and query columns -->
-        <div class="row content-row gx-3"> <!-- gx-3 adds horizontal gutter -->
-
-            <!-- Graph Column (Larger) -->
-            <div class="col-md-9 graph-column">
-                <div id="graph-container"></div>
-            </div>
-
-            <!-- Query Column (Smaller) -->
-            <div class="col-md-3 query-column">
-                <div class="query-section card">
-                    <div class="card-header">Query the Knowledge Graph</div>
-                    <div class="card-body">
-                        <div class="form-group flex-shrink-0"> <!-- Prevent input group shrinking -->
-                            <input type="text" id="query-input" class="form-control" placeholder="Ask a question...">
-                            <button id="submit-query" class="btn btn-primary mt-2">Submit Query</button>
-                        </div>
-                        <div id="query-result" class="mt-2">Waiting for query...</div>
-                    </div>
-                </div>
-            </div>
-
-        </div> <!-- End content-row -->
-
-        <!-- Status Bar below the row -->
-        <div id="status" class="status-bar info">Initializing...</div>
-
-    </div> <!-- End main-content-area -->
-
-    <!-- Socket.IO Client Library -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
-    <!-- Vis.js Network Library -->
-    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-    <!-- Main JavaScript (No changes needed from previous version) -->
-    <script type="text/javascript">
-        // Global variables
-        const socket = io(); // Connect to Socket.IO server
-        let network = null;
-        let nodes = new vis.DataSet([]);
-        let edges = new vis.DataSet([]);
-
-        // DOM Elements
+    <script>
+        const toggleAudioButton = document.getElementById('toggleAudioButton');
         const statusDiv = document.getElementById('status');
-        const graphContainer = document.getElementById('graph-container');
-        const queryInput = document.getElementById('query-input');
-        const submitQueryBtn = document.getElementById('submit-query');
-        const queryResult = document.getElementById('query-result');
+        const queryInput = document.getElementById('queryInput');
+        const queryButton = document.getElementById('queryButton');
+        const queryResultDiv = document.getElementById('queryResult');
+        const networkContainer = document.getElementById('mynetwork');
 
-        // Initialize Graph Visualization
+        // --- Config ---
+        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
+        const TARGET_SAMPLE_RATE = 16000; // Must match backend's LIVE_API_SAMPLE_RATE
+        const WORKLET_PROCESSOR_NAME = 'audio-processor';
+        const WORKLET_PATH = '/static/audio-processor.js'; // Path to the worklet file (adjust if needed)
+
+        // --- State ---
+        let socket = null;
+        let audioContext = null;
+        let microphoneNode = null;
+        let audioWorkletNode = null;
+        let isStreaming = false;
+
+        // --- Vis.js Graph Setup ---
+        let network = null;
+        const nodes = new vis.DataSet([]);
+        const edges = new vis.DataSet([]);
+        const graphData = { nodes: nodes, edges: edges };
+        const graphOptions = {
+            nodes: {
+                shape: 'dot',
+                size: 16,
+                font: { size: 12, color: '#000000' },
+                borderWidth: 2
+            },
+            edges: {
+                width: 2,
+                arrows: 'to',
+                font: { align: 'horizontal', middle: true, size: 10 }
+            },
+            physics: {
+                // stabilization: false, // Enable/disable for performance vs layout
+                 barnesHut: {
+                    gravitationalConstant: -8000, // Adjust forces as needed
+                    springConstant: 0.04,
+                    springLength: 150
+                 }
+            },
+            groups: { // Example groups for styling
+                 Person: { color:{background:'lightblue', border:'blue'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf007', size: 50, color: 'blue'} },
+                 Organization: { color:{background:'lightgreen', border:'green'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf1ad', size: 50, color: 'green'} },
+                 Project: { color:{background:'lightcoral', border:'red'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf0b1', size: 50, color: 'red'} },
+                 // Add more groups based on your expected RDF types
+                 Instance: { color: { background: '#CCCCCC', border: '#AAAAAA' } } // Default
+             }
+        };
+
         function initializeGraph() {
-            const data = { nodes: nodes, edges: edges };
-            const options = {
-                layout: {},
-                nodes: { shape: 'box', font: { size: 14, face: 'arial' }, borderWidth: 1, shapeProperties: { borderRadius: 3 }, margin: 10 },
-                edges: { arrows: { to: { enabled: true, scaleFactor: 0.7 } }, font: { size: 12, align: 'middle' }, color: { inherit: false, color: '#848484', highlight:'#848484', hover: '#848484', opacity:1.0 }, smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 } },
-                physics: { enabled: true, solver: 'barnesHut', barnesHut: { gravitationalConstant: -4000, centralGravity: 0.15, springLength: 130, springConstant: 0.06, damping: 0.15 }, stabilization: { iterations: 150 } },
-                interaction: { tooltipDelay: 200, hover: true, zoomView: true, dragView: true }
-            };
-            network = new vis.Network(graphContainer, data, options);
-
-            network.on("stabilizationIterationsDone", function () {
-                 console.log("Graph stabilization complete.");
-                 network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' }});
-            });
-
-            network.on("click", function (params) { console.log('Graph element clicked:', params); });
-
-            // Resize handler
-            let resizeTimer;
-            window.addEventListener('resize', () => {
-                clearTimeout(resizeTimer);
-                resizeTimer = setTimeout(() => {
-                     if (network) {
-                        console.log("Resizing graph...");
-                        network.redraw(); // Redraw first
-                        network.fit(); // Then fit
-                    }
-                }, 250); // Debounce resize event
-            });
+            network = new vis.Network(networkContainer, graphData, graphOptions);
+            console.log("Vis.js Network initialized.");
         }
 
-        // UI Update Functions
-        function updateStatus(message, type = 'info') {
-            statusDiv.textContent = message;
-            statusDiv.className = `status-bar ${type}`; // Ensure class includes 'status-bar'
-        }
-
-        // Socket.IO Event Handlers
-        socket.on('connect', () => { updateStatus('Connected to server. Ready.'); console.log('Socket.IO connected'); });
-        socket.on('disconnect', () => { updateStatus('Disconnected from server.', 'error'); console.log('Socket.IO disconnected'); });
-        socket.on('connect_error', (err) => { updateStatus(`Connection Error: ${err.message}`, 'error'); console.error('Socket.IO connection error:', err); });
-
-        socket.on('update_graph', (data) => {
+        function updateGraph(data) {
             console.log("Received graph update:", data);
-            if (data && Array.isArray(data.nodes) && Array.isArray(data.edges)) {
-                updateStatus(`Graph updated: ${data.nodes.length} nodes, ${data.edges.length} edges.`);
-                // Batch update/remove logic (more robust than simple update/clear)
-                const receivedNodeIds = new Set(data.nodes.map(n => n.id));
-                const receivedEdgeSignatures = new Set(data.edges.map(e => `${e.from}|${e.to}|${e.label || ''}`)); // Create unique signature
+            try {
+                // Clear existing data efficiently
+                // nodes.clear(); // This might cause flickering, update/remove is better
+                // edges.clear();
 
-                let nodesToRemove = nodes.getIds().filter(id => !receivedNodeIds.has(id));
-                let edgesToRemove = [];
-                edges.get().forEach(edge => {
-                    const signature = `${edge.from}|${edge.to}|${edge.label || ''}`;
-                    if (!receivedEdgeSignatures.has(signature)) {
-                        edgesToRemove.push(edge.id); // Assumes edges dataset uses internal IDs
+                const receivedNodeIds = new Set(data.nodes.map(n => n.id));
+                const receivedEdgeIds = new Set(data.edges.map(e => e.id || `${e.from}-${e.to}-${e.label}`)); // Generate edge id if missing
+
+                // Remove nodes no longer present
+                const nodesToRemove = nodes.getIds().filter(id => !receivedNodeIds.has(id));
+                if (nodesToRemove.length > 0) {
+                    console.log("Removing nodes:", nodesToRemove);
+                    nodes.remove(nodesToRemove);
+                }
+
+                // Remove edges no longer present
+                 const edgesToRemove = edges.getIds().filter(id => !receivedEdgeIds.has(id));
+                 // Also remove edges connected to removed nodes
+                 edges.getIds().forEach(edgeId => {
+                     const edge = edges.get(edgeId);
+                     if (!edge || nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to)) {
+                         if (!edgesToRemove.includes(edgeId)) {
+                             edgesToRemove.push(edgeId);
+                         }
+                     }
+                 });
+                 if (edgesToRemove.length > 0) {
+                     console.log("Removing edges:", edgesToRemove);
+                     edges.remove(edgesToRemove);
+                 }
+
+
+                // Add or update nodes and edges
+                nodes.update(data.nodes);
+                // Ensure edges have unique IDs if not provided by backend
+                const edgesWithIds = data.edges.map((e, index) => ({
+                    id: e.id || `${e.from}-${e.to}-${e.label || index}`, // Generate unique ID
+                    ...e
+                }));
+                edges.update(edgesWithIds);
+
+            } catch (error) {
+                console.error("Error updating graph:", error);
+                updateStatus(`Error updating graph: ${error.message}`, true);
+            }
+        }
+
+
+        // --- Socket.IO Connection ---
+        function connectSocket() {
+            if (socket && socket.connected) {
+                console.log("Already connected.");
+                return;
+            }
+
+            updateStatus("Connecting to server...");
+            socket = io(SERVER_URL);
+
+            socket.on('connect', () => {
+                updateStatus("Connected. Ready to start.");
+                toggleAudioButton.disabled = false;
+            });
+
+            socket.on('disconnect', () => {
+                updateStatus("Disconnected.", true);
+                if (isStreaming) {
+                    stopStreaming(); // Stop audio if disconnected unexpectedly
+                }
+                toggleAudioButton.textContent = 'Start Listening';
+                toggleAudioButton.disabled = true; // Disable until reconnected
+                // Maybe attempt reconnection? socket.io does this by default.
+            });
+
+            socket.on('connect_error', (err) => {
+                updateStatus(`Connection error: ${err.message}`, true);
+                toggleAudioButton.disabled = true;
+            });
+
+            socket.on('error', (data) => {
+                updateStatus(`Server error: ${data.message}`, true);
+                // Decide if error warrants stopping stream
+                // if (isStreaming) stopStreaming();
+            });
+
+            // Listen for graph updates
+            socket.on('update_graph', (data) => {
+                if (network) {
+                    updateGraph(data);
+                } else {
+                    console.warn("Received graph update but network not initialized yet.");
+                }
+            });
+
+             // Listen for query results
+            socket.on('query_result', (data) => {
+                console.log("Query result:", data);
+                if (data.error) {
+                    queryResultDiv.textContent = `Error: ${data.answer}`;
+                    queryResultDiv.classList.add('error');
+                } else if (data.processing) {
+                    queryResultDiv.textContent = data.answer;
+                    queryResultDiv.classList.remove('error');
+                }
+                else {
+                    queryResultDiv.textContent = data.answer;
+                    queryResultDiv.classList.remove('error');
+                }
+                queryButton.disabled = false; // Re-enable button
+                queryInput.disabled = false;
+            });
+
+            // Listen for server confirmation of start/stop
+             socket.on('audio_started', () => {
+                updateStatus("Streaming audio...");
+                isStreaming = true;
+                toggleAudioButton.textContent = 'Stop Listening';
+            });
+
+            socket.on('audio_stopped', () => {
+                updateStatus("Stopped.");
+                // UI already updated in stopStreaming() but this confirms server ack
+            });
+        }
+
+        // --- Audio Processing ---
+        async function startStreaming() {
+            if (isStreaming || !socket || !socket.connected) {
+                console.log("Cannot start streaming. Not connected or already streaming.");
+                return;
+            }
+            updateStatus("Initializing audio...");
+            toggleAudioButton.disabled = true; // Disable while starting
+
+            try {
+                if (!audioContext) {
+                    audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+                }
+                 // Resume context if suspended (required for user gesture)
+                 if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+
+                // Load the AudioWorklet processor
+                try {
+                    await audioContext.audioWorklet.addModule(WORKLET_PATH);
+                } catch (e) {
+                     console.error(`Failed to load AudioWorklet module from ${WORKLET_PATH}:`, e);
+                     updateStatus(`Error: Could not load audio processor. ${e.message}`, true);
+                     toggleAudioButton.disabled = false;
+                     return;
+                }
+
+
+                // Get microphone input
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: TARGET_SAMPLE_RATE // Request desired rate
                     }
                 });
 
-                if (nodesToRemove.length > 0) nodes.remove(nodesToRemove);
-                if (edgesToRemove.length > 0) edges.remove(edgesToRemove);
-                if (data.nodes.length > 0) nodes.update(data.nodes); // Use update to add/modify
-                if (data.edges.length > 0) edges.update(data.edges); // Use update to add/modify
+                microphoneNode = audioContext.createMediaStreamSource(stream);
 
-            } else {
-                console.error("Received invalid graph data format:", data);
-                updateStatus('Received invalid graph data.', 'error');
+                // Create the AudioWorklet node
+                audioWorkletNode = new AudioWorkletNode(audioContext, WORKLET_PROCESSOR_NAME);
+
+                // Handle messages (audio buffers) from the worklet
+                audioWorkletNode.port.onmessage = (event) => {
+                    if (socket && socket.connected && isStreaming) {
+                         // event.data should be the Int16Array buffer from the worklet
+                        socket.emit('audio_chunk', event.data);
+                        // console.log(`Sent audio chunk: ${event.data.byteLength} bytes`);
+                    }
+                };
+
+                 audioWorkletNode.port.onerror = (event) => {
+                     console.error("Error from AudioWorklet:", event);
+                     updateStatus(`Audio processing error: ${event.message || 'Unknown'}`, true);
+                     stopStreaming(); // Stop on worklet error
+                 };
+
+
+                // Connect the microphone to the worklet
+                microphoneNode.connect(audioWorkletNode);
+                // It's often required to connect the worklet output to the destination
+                // even if you don't want to hear the audio, to keep the graph running.
+                audioWorkletNode.connect(audioContext.destination); // Connect to output
+
+                // Signal the backend to prepare for audio
+                socket.emit('start_audio');
+
+                // Note: Actual streaming state (isStreaming=true) is set upon receiving 'audio_started'
+                // toggleAudioButton.textContent = 'Stop Listening'; // Moved to 'audio_started' handler
+                // isStreaming = true; // Moved to 'audio_started' handler
+                 updateStatus("Requested start. Waiting for server confirmation...");
+
+
+            } catch (err) {
+                console.error("Error starting audio stream:", err);
+                updateStatus(`Error: ${err.message}`, true);
+                stopStreaming(); // Clean up if start failed
+                toggleAudioButton.disabled = false; // Re-enable button on failure
             }
-        });
+        }
 
-        socket.on('query_result', (data) => {
-            console.log("Received query result:", data);
-            queryResult.textContent = data.answer; // Display answer directly
-            if (data.error) {
-                queryResult.style.color = 'red';
-            } else if (data.processing) {
-                 queryResult.style.color = 'grey';
-            } else {
-                queryResult.style.color = 'black';
+        function stopStreaming() {
+            if (!isStreaming && !audioContext && !microphoneNode) {
+                 console.log("Already stopped or not initialized.");
+                 // Ensure button state is correct if called redundantly
+                 toggleAudioButton.textContent = 'Start Listening';
+                 toggleAudioButton.disabled = !(socket && socket.connected);
+                 return;
             }
-        });
 
-        socket.on('error', (data) => { console.error("Server error:", data.message); updateStatus(`Server Error: ${data.message}`, 'error'); });
-        socket.on('info', (data) => { console.info("Server info:", data.message); updateStatus(data.message, 'info'); });
+            updateStatus("Stopping audio stream...");
+            isStreaming = false; // Set immediately to prevent sending more data
 
-        // Event Listeners
-        submitQueryBtn.addEventListener('click', () => {
+            if (socket && socket.connected) {
+                socket.emit('stop_audio'); // Inform the backend
+            }
+
+            if (audioWorkletNode) {
+                audioWorkletNode.port.onmessage = null; // Remove listener
+                 audioWorkletNode.port.onerror = null;
+                audioWorkletNode.disconnect();
+                audioWorkletNode = null;
+                console.log("AudioWorkletNode disconnected.");
+            }
+            if (microphoneNode) {
+                microphoneNode.disconnect();
+                 // Stop the tracks of the original stream
+                 if (microphoneNode.mediaStream) {
+                     microphoneNode.mediaStream.getTracks().forEach(track => track.stop());
+                     console.log("Microphone stream tracks stopped.");
+                 }
+                microphoneNode = null;
+
+            }
+             // Close AudioContext gracefully
+            // if (audioContext && audioContext.state !== 'closed') {
+            //     audioContext.close().then(() => {
+            //         console.log("AudioContext closed.");
+            //         audioContext = null;
+            //     });
+            // } else {
+            //      audioContext = null; // Ensure it's null if already closed or never opened
+            // }
+             // Keep context open for potential restart? Or close? Let's keep it open for now.
+             // If closing: ensure it's recreated on next start.
+
+
+            toggleAudioButton.textContent = 'Start Listening';
+            toggleAudioButton.disabled = !(socket && socket.connected); // Enable if connected
+
+            // Status update is handled by 'audio_stopped' from server or set here if no ack needed
+             // updateStatus("Stopped."); // Or wait for server confirmation
+        }
+
+        // --- Query Handling ---
+        function sendQuery() {
             const query = queryInput.value.trim();
-            if (query) {
-                queryResult.textContent = 'Sending query...';
-                queryResult.style.color = 'grey';
-                console.log(`Emitting query_graph event with query: ${query}`);
-                socket.emit('query_graph', { query: query });
-                // queryInput.value = ''; // Decide whether to clear input
+            if (!query) {
+                queryResultDiv.textContent = "Please enter a query.";
+                queryResultDiv.classList.add('error');
+                return;
+            }
+            if (!socket || !socket.connected) {
+                queryResultDiv.textContent = "Not connected to the server.";
+                queryResultDiv.classList.add('error');
+                return;
+            }
+
+            console.log("Sending query:", query);
+            queryResultDiv.textContent = "Sending query...";
+            queryResultDiv.classList.remove('error');
+            queryButton.disabled = true; // Disable while processing
+            queryInput.disabled = true;
+            socket.emit('query_graph', { query: query });
+        }
+
+        // --- Event Listeners ---
+        toggleAudioButton.addEventListener('click', () => {
+            if (!isStreaming) {
+                startStreaming();
             } else {
-                queryResult.textContent = 'Please enter a query.';
-                queryResult.style.color = 'orange';
+                stopStreaming();
             }
         });
 
-        queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { submitQueryBtn.click(); } });
+        queryButton.addEventListener('click', sendQuery);
+        queryInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                sendQuery();
+            }
+        });
 
-        // Initialize on page load
-        document.addEventListener('DOMContentLoaded', () => { initializeGraph(); updateStatus('Connecting to server...'); });
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeGraph();
+            connectSocket();
+            toggleAudioButton.disabled = true; // Disabled until connected
+        });
+
+        // Clean up on page leave
+        window.addEventListener('beforeunload', () => {
+             if (isStreaming) {
+                 stopStreaming(); // Attempt to stop gracefully
+             }
+            if (socket) {
+                socket.disconnect();
+            }
+        });
+
+         function updateStatus(message, isError = false) {
+            console.log(`Status: ${message}`);
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = isError ? 'error' : ''; // Use class for styling errors
+        }
+
+
     </script>
 </body>
 </html>
