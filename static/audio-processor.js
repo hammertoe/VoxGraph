@@ -49,7 +49,6 @@ class AudioProcessor extends AudioWorkletProcessor {
         // Post the Int16Array buffer back to the main thread
         // The second argument is a list of Transferable objects (optional, avoids copying)
         try {
-          console.log("Posting message from worklet:", pcm16Buffer);
             this.port.postMessage(pcm16Buffer, [pcm16Buffer.buffer]);
         } catch (error) {
             // Firefox might have issues transferring buffers that originated elsewhere.
