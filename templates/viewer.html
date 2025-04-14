@@ -3,307 +3,234 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VoxGraph - Graph Viewer</title>
-    <!-- Include Socket.IO client library -->
+    <title>VoxGraph Viewer - Session {{ session_id[:6] }}...</title> 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
-    <!-- Include Vis.js for graph visualization -->
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
-    <!-- Font Awesome for Icons (Optional, but needed if using icon groups) -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
     <style>
-        html, body {
-            height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: sans-serif;
-        }
-        #controls { /* New container for controls */
-            position: fixed;
-            top: 10px;
-            right: 10px;
-            background-color: rgba(240, 240, 240, 0.8);
-            padding: 8px 12px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
+        /* Using Simplified Layout Styles */
+        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: sans-serif; }
+        #graph-container { height: calc(100% - 25px); width: 100%; position: relative; }
+        #mynetwork { width: 100%; height: 100%; }
+        #controls {
+            position: absolute; top: 10px; right: 10px;
+            background-color: rgba(240, 240, 240, 0.9);
+            padding: 10px 15px; border-radius: 5px; border: 1px solid #ccc;
             z-index: 10;
-            display: flex; /* Align items horizontally */
-            align-items: center; /* Center items vertically */
+            display: flex; flex-direction: column; align-items: flex-start; 
         }
-        /* Toggle Switch Styles */
-        .switch-container {
-            display: flex;
-            align-items: center;
-            margin-right: 10px; /* Space before label */
+        #status { height: 25px; line-height: 25px; padding: 0 10px; font-size: 0.9em; background-color: #f0f0f0; border-top: 1px solid #ccc; width: 100%; text-align: center; box-sizing: border-box; position: fixed; bottom: 0; left: 0; z-index: 5; }
+        .switch-container { display: flex; align-items: center; margin-bottom: 10px; }
+        .switch-container span { margin-left: 5px; font-size: 0.9em; }
+        .switch { position: relative; display: inline-block; width: 50px; height: 24px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #2196F3; }
+        input:checked + .slider:before { transform: translateX(26px); }
+
+        #mobile-link-section { margin-top: 10px; border-top: 1px solid #ddd; padding-top: 10px; width: 100%; }
+        #mobile-link-section p { margin: 2px 0; font-size: 0.9em; }
+        #mobile-link-section a { color: #337ab7; text-decoration: none; font-size: 0.85em; word-break: break-all; }
+        #mobile-link-section a:hover { text-decoration: underline; }
+        #qrcode {
+             margin-top: 5px; background-color: white; padding: 5px; border: 1px solid #eee;
+             width: 100px; height: 100px; 
+             display: flex; justify-content: center; align-items: center;
         }
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 50px; /* Width of the switch */
-            height: 24px; /* Height of the switch */
-        }
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        .slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #ccc;
-            transition: .4s;
-            border-radius: 24px; /* Rounded corners */
-        }
-        .slider:before {
-            position: absolute;
-            content: "";
-            height: 18px; /* Size of the knob */
-            width: 18px;
-            left: 3px; /* Position of the knob */
-            bottom: 3px;
-            background-color: white;
-            transition: .4s;
-            border-radius: 50%; /* Make it round */
-        }
-        input:checked + .slider {
-            background-color: #2196F3; /* Color when ON */
-        }
-        input:checked + .slider:before {
-            transform: translateX(26px); /* Move knob to the right */
-        }
-        #graph-container {
-            width: 100%;
-            height: calc(100% - 25px); /* Account for status bar */
-            border: none;
-        }
-        #mynetwork {
-            width: 100%; height: 100%; border: none;
-        }
-        #status {
-            padding: 5px; font-size: 0.9em; background-color: #f0f0f0;
-            border-top: 1px solid #ccc; position: fixed; bottom: 0;
-            width: 100%; text-align: center; z-index: 5; /* Ensure status is below controls */
-        }
+         #qrcode canvas { max-width: 100%; height: auto; }
         .error { color: red; font-weight: bold; }
     </style>
 </head>
 <body>
-    <!-- Control Bar -->
-    <div id="controls">
-         <div class="switch-container">
-            <label class="switch">
-                <input type="checkbox" id="provenanceToggle">
-                <span class="slider"></span>
-            </label>
-             <span>Provenance</span> <!-- Label for the switch -->
-         </div>
-        <!-- Add other controls like Export button here if needed -->
-        <!-- <button id="exportPngButton">Export PNG</button> -->
-    </div>
-
     <div id="graph-container">
         <div id="mynetwork"></div>
+        <div id="controls">
+             <div class="switch-container">
+                <label class="switch">
+                    <input type="checkbox" id="provenanceToggle">
+                    <span class="slider"></span>
+                </label>
+                 <span>Provenance</span>
+             </div>
+             <div id="mobile-link-section">
+                  <p><strong>Mobile Link:</strong></p>
+                  <a id="mobileLink" href="#" target="_blank">Generating link...</a>
+                  <div id="qrcode">Loading QR...</div>
+             </div>
+        </div>
     </div>
-    <div id="status">Status: Connecting...</div>
+    <div id="status">Status: Initializing...</div>
 
     <script>
+        // --- Config & State ---
+        const SESSION_ID = "{{ session_id }}";
+        console.log("Session ID:", SESSION_ID);
+
         const statusDiv = document.getElementById('status');
         const networkContainer = document.getElementById('mynetwork');
-        const provenanceToggle = document.getElementById('provenanceToggle'); // Get the toggle switch
+        const provenanceToggle = document.getElementById('provenanceToggle');
+        const mobileLinkElement = document.getElementById('mobileLink');
+        const qrCodeElement = document.getElementById('qrcode');
 
-        // --- Config ---
-        const SERVER_URL = `${window.location.hostname}:${window.location.port}`; // Dynamically get server address
-        const PROVENANCE_NODE_GROUP = "Transcription"; // Group name assigned by backend
-        const PROVENANCE_EDGE_LABEL = "sourceTranscriptionCID"; // Edge label assigned by backend
-
-        // --- State ---
         let socket = null;
-        let showProvenance = false; // Default to false (hidden)
-
-        // --- Vis.js Graph Setup ---
+        let showProvenance = false;
         let network = null;
-        // Original datasets holding ALL data from server
         const nodes = new vis.DataSet([]);
         const edges = new vis.DataSet([]);
+        const PROVENANCE_NODE_GROUP = "Transcription";
+        const PROVENANCE_EDGE_LABEL = "ex:derivedFromTranscript";
 
-        // Filter function for nodes and edges
-        function provenanceFilter(item) {
-            if (showProvenance) {
-                return true; // Show everything if toggled ON
-            } else {
-                // Hide nodes with the specific group and edges with the specific label
-                if (item.group === PROVENANCE_NODE_GROUP) {
-                    return false; // Hide transcription node
-                }
-                if (item.label === PROVENANCE_EDGE_LABEL) {
-                    return false; // Hide provenance edge
-                }
-                return true; // Show all other items
-            }
-        }
-
-        // DataViews based on the original datasets and the filter function
+        // --- Vis.js Setup ---
         const nodeView = new vis.DataView(nodes, { filter: provenanceFilter });
         const edgeView = new vis.DataView(edges, { filter: provenanceFilter });
-
-        // Graph data object now uses the DataViews
         const graphData = { nodes: nodeView, edges: edgeView };
+        const graphOptions = { 
+             nodes: { shape: 'dot', size: 16, font: { size: 12, color: '#000000' }, borderWidth: 2 },
+             edges: { width: 2, arrows: 'to', font: { align: 'horizontal', size: 10 }, smooth: { enabled: true, type: "dynamic", roundness: 0.5 } },
+             physics: { enabled: true, barnesHut: { gravitationalConstant: -8000, springConstant: 0.04, springLength: 150 } },
+             groups: {
+                  "ex:Person": { color:{background:'lightblue', border:'blue'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf007', size: 50, color: 'blue'} },
+                  "ex:Company": { color:{background:'lightgreen', border:'green'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf1ad', size: 50, color: 'green'} },
+                  "ex:Project": { color:{background:'lightcoral', border:'red'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf0b1', size: 50, color: 'red'} },
+                  [PROVENANCE_NODE_GROUP]: { color: { background: '#f0e68c', border: '#adad85'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf15c', size: 30, color: '#8b4513' }, size: 10 },
+                  Instance: { color: { background: '#CCCCCC', border: '#AAAAAA' } }
+              }
+         };
 
-        const graphOptions = {
-            nodes: {
-                shape: 'dot',
-                size: 16,
-                font: { size: 12, color: '#000000' },
-                borderWidth: 2
-            },
-            edges: {
-                width: 2,
-                arrows: 'to',
-                font: { align: 'horizontal', middle: true, size: 10 },
-                smooth: { // Optional: improve performance slightly
-                    enabled: true,
-                    type: "dynamic",
-                    roundness: 0.5
-                }
-            },
-            physics: {
-                 enabled: true, // Make sure physics is enabled
-                 barnesHut: { gravitationalConstant: -8000, springConstant: 0.04, springLength: 150 }
-            },
-             groups: { // Define groups for styling
-                 "ex:Person": { color:{background:'lightblue', border:'blue'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf007', size: 50, color: 'blue'} },
-                 "ex:Company": { color:{background:'lightgreen', border:'green'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf1ad', size: 50, color: 'green'} },
-                 "ex:Project": { color:{background:'lightcoral', border:'red'}, shape: 'icon', icon: { face: 'FontAwesome', code: '\uf0b1', size: 50, color: 'red'} },
-                 // Style for the Transcription nodes when visible
-                 [PROVENANCE_NODE_GROUP]: { // Use the constant here
-                    color: { background: '#f0e68c', border: '#adad85'}, // Khaki color
-                    shape: 'icon',
-                    icon: { face: 'FontAwesome', code: '\uf15c', size: 30, color: '#8b4513' }, // File-text icon, saddlebrown
-                    size: 10 // Make them smaller
-                 },
-                 Instance: { color: { background: '#CCCCCC', border: '#AAAAAA' } } // Default
-             }
-             // Note: Edge styling (like dashes) is applied via the data property added by the backend
-        };
+        function provenanceFilter(item) {
+             if (showProvenance) return true;
+             if (item.group === PROVENANCE_NODE_GROUP) return false;
+             if (item.label === PROVENANCE_EDGE_LABEL) return false;
+             return true;
+        }
 
         function initializeGraph() {
-            // Initialize network with the DataViews
-            network = new vis.Network(networkContainer, graphData, graphOptions);
-            console.log("Vis.js Network initialized with DataViews.");
+             if (network) return;
+             try {
+                 console.log("Initializing Vis.js network (Simple Layout)...");
+                 network = new vis.Network(networkContainer, graphData, graphOptions);
+                 console.log("Vis.js Network initialized.");
+
+                 if (provenanceToggle) provenanceToggle.checked = showProvenance;
+                 updateStatus("Graph initialized. Waiting for connection...");
+
+             } catch (err) { console.error("Init Error:", err); updateStatus(`Init Error: ${err.message}`, true); }
         }
 
         function updateGraph(data) {
-            console.log("Received graph update:", data);
-            try {
-                // Update the original DataSets - the Views will update automatically
-                const nodesToAddUpdate = data.nodes || [];
-                const edgesToAddUpdate = (data.edges || []).map((e, index) => ({
-                     id: e.id || `${e.from}-${e.to}-${e.label || index}`, ...e })); // Ensure edges have IDs
-
-                 // --- More efficient update using diff ---
+             if (!network) { console.warn("Update received before network init."); return; }
+             try {
+                 const nodesToAddUpdate = data.nodes || [];
+                 const edgesToAddUpdate = (data.edges || []).map((e, index) => ({ id: e.id || `${e.from}-${e.to}-${e.label || index}`, ...e }));
                  const currentNodeIds = new Set(nodes.getIds());
                  const currentEdgeIds = new Set(edges.getIds());
                  const receivedNodeIds = new Set(nodesToAddUpdate.map(n => n.id));
                  const receivedEdgeIds = new Set(edgesToAddUpdate.map(e => e.id));
-
                  const nodesToRemove = [...currentNodeIds].filter(id => !receivedNodeIds.has(id));
                  const edgesToRemove = [...currentEdgeIds].filter(id => !receivedEdgeIds.has(id));
+                 edges.get({ filter: edge => nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to) })
+                      .forEach(edge => { if (edge && edge.id && !edgesToRemove.includes(edge.id)) edgesToRemove.push(edge.id); });
 
-                  // Remove edges connected to removed nodes
-                  edges.get({ filter: edge => nodesToRemove.includes(edge.from) || nodesToRemove.includes(edge.to) })
-                       .forEach(edge => { if (!edgesToRemove.includes(edge.id)) edgesToRemove.push(edge.id); });
+                 let updatesMade = false;
+                 if (nodesToRemove.length > 0) { nodes.remove(nodesToRemove); updatesMade = true; }
+                 if (edgesToRemove.length > 0) { edges.remove(edgesToRemove); updatesMade = true; }
+                 if (nodesToAddUpdate.length > 0) { nodes.update(nodesToAddUpdate); updatesMade = true; }
+                 if (edgesToAddUpdate.length > 0) { edges.update(edgesToAddUpdate); updatesMade = true; }
 
-
-                 if (nodesToRemove.length > 0) {
-                     console.debug("Removing nodes:", nodesToRemove);
-                     nodes.remove(nodesToRemove);
+                 if(updatesMade) {
+                     console.debug(`Graph DataSet updated: ${nodes.length} nodes, ${edges.length} edges.`);
+                     updateStatus("Graph updated.");
+                     network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+                 } else {
+                     console.debug("Graph update received, no changes detected.");
+                     updateStatus("Received update, no graph changes.");
                  }
-                 if (edgesToRemove.length > 0) {
-                    console.debug("Removing edges:", edgesToRemove);
-                    edges.remove(edgesToRemove);
+             } catch (error) { console.error("Error updating graph:", error); updateStatus(`Error updating graph: ${error.message}`, true); }
+         }
+
+        function setupMobileLinkAndQR() {
+             const mobileUrl = `${window.location.origin}/mobile/${SESSION_ID}`;
+             // Check if elements exist before using them
+             if (mobileLinkElement) {
+                 mobileLinkElement.href = mobileUrl;
+                 mobileLinkElement.textContent = "Link"; // Shorter text for controls
+                 mobileLinkElement.title = mobileUrl; // Show full URL on hover
+             } else { console.warn("Mobile link element not found.")};
+
+             if (qrCodeElement) {
+                 qrCodeElement.innerHTML = ''; // Clear loading text
+                 try {
+                     // Use smaller size for controls
+                     new QRCode(qrCodeElement, {
+                         text: mobileUrl, width: 90, height: 90, // Smaller size
+                         colorDark : "#000000", colorLight : "#ffffff",
+                         correctLevel : QRCode.CorrectLevel.M // Medium correction is fine for URLs
+                     });
+                     console.log("QR Code generated inside controls for:", mobileUrl);
+                 } catch (err) {
+                    console.error("Failed to generate QR Code:", err);
+                    qrCodeElement.textContent = "QR Error";
                  }
-                 if (nodesToAddUpdate.length > 0) {
-                     nodes.update(nodesToAddUpdate);
-                 }
-                 if (edgesToAddUpdate.length > 0) {
-                     edges.update(edgesToAddUpdate);
-                 }
-                 console.debug(`Graph updated: ${nodes.length} nodes, ${edges.length} edges in DataSet.`);
-
-            } catch (error) {
-                console.error("Error updating graph:", error);
-                updateStatus(`Error updating graph: ${error.message}`, true);
-            }
-        }
-
-        // --- Socket.IO Connection ---
-        function connectSocket() {
-            if (socket && socket.connected) return;
-            updateStatus("Connecting to server...");
-            socket = io(SERVER_URL);
-
-            socket.on('connect', () => {
-                updateStatus("Connected. Waiting for updates.");
-            });
-
-            socket.on('disconnect', (reason) => {
-                updateStatus(`Disconnected: ${reason}`, true);
-            });
-
-            socket.on('connect_error', (err) => {
-                updateStatus(`Connection error: ${err.message}`, true);
-            });
-
-            socket.on('error', (data) => {
-                updateStatus(`Server error: ${data.message}`, true);
-            });
-
-            socket.on('update_graph', (data) => {
-                if (network) {
-                    updateGraph(data);
-                } else {
-                    console.warn("Graph update received before network init.");
-                }
-            });
-        }
+             } else { console.warn("QR code element not found.")};
+         }
 
         function updateStatus(message, isError = false) {
             console.log(`Status: ${message}`);
-            statusDiv.textContent = `Status: ${message}`;
-            statusDiv.className = isError ? 'error' : '';
+            if(statusDiv) {
+                 statusDiv.textContent = `Status: ${message}`;
+                 statusDiv.className = isError ? 'error' : '';
+            }
         }
 
-        // --- Toggle Switch Logic ---
+        // Socket.IO Connection (Enabled)
+        function connectSocket() {
+            if (socket && socket.connected) return;
+            updateStatus("Connecting to server...");
+            const SERVER_URL = `${window.location.protocol}//${window.location.hostname}:${window.location.port}`;
+            socket = io(SERVER_URL);
+
+            socket.on('connect', () => {
+                updateStatus("Connected. Joining session...");
+                socket.emit('join_session', { session_id: SESSION_ID });
+                updateStatus("Joined session. Waiting for updates.");
+            });
+            socket.on('disconnect', (reason) => { updateStatus(`Disconnected: ${reason}`, true); });
+            socket.on('connect_error', (err) => { updateStatus(`Connection error: ${err.message}`, true); });
+            socket.on('error', (data) => { updateStatus(`Server error: ${data?.message || 'Unknown'}`, true); });
+            socket.on('update_graph', (data) => {
+                if (network) { updateGraph(data); }
+                else { console.warn("Graph update received before network init."); }
+            });
+        }
+
+
+        // Provenance Toggle Logic
         if (provenanceToggle) {
-            provenanceToggle.checked = showProvenance; // Initialize based on default state
+            provenanceToggle.checked = showProvenance;
             provenanceToggle.addEventListener('change', (event) => {
                 showProvenance = event.target.checked;
                 console.log(`Provenance visibility set to: ${showProvenance}`);
-                // Refresh the DataViews to apply the new filter state
-                if (nodeView && edgeView) {
-                    nodeView.refresh();
-                    edgeView.refresh();
-                }
+                if (nodeView && edgeView) { nodeView.refresh(); edgeView.refresh(); console.log("Graph views refreshed."); }
+                else { console.warn("Could not refresh views?"); }
             });
-        } else {
-            console.error("Provenance toggle switch not found!");
-        }
+        } else { console.error("Provenance toggle switch not found!"); }
 
 
         // --- Initialization ---
         document.addEventListener('DOMContentLoaded', () => {
-            initializeGraph(); // Init with DataViews
-            connectSocket();
+            console.log("DOMContentLoaded event fired.");
+            initializeGraph();      // Initialize Vis.js
+            setupMobileLinkAndQR(); // Setup link and QR code in controls
+            connectSocket();        // Connect Socket.IO
+            console.log("Vis Initialized. SocketIO Enabled. QR Code Enabled.");
         });
 
-        // Clean up on page leave
-        window.addEventListener('beforeunload', () => {
-            if (socket) {
-                socket.disconnect();
-            }
-        });
+        // Keep beforeunload listener
+        window.addEventListener('beforeunload', () => { if (socket) { socket.disconnect(); } });
 
     </script>
 </body>

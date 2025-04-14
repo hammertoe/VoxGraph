@@ -3,53 +3,38 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>VoxGraph - Mobile Input</title>
+    <!-- Add Session ID to Title -->
+    <title>VoxGraph Mobile - Session {{ session_id[:6] }}...</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
     <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
-        #controls { padding: 15px; border-bottom: 1px solid #ccc; background-color: #f8f8f8; text-align: center; }
-        #controls button { padding: 12px 20px; font-size: 1.1em; cursor: pointer; margin-right: 10px; border-radius: 5px;}
-        /* Style for the volume meter */
-        #volumeMeterContainer {
-            height: 20px; /* Height of the meter */
-            width: 90%;  /* Width relative to controls */
-            max-width: 300px; /* Max width */
-            background-color: #e0e0e0;
-            border: 1px solid #ccc;
-            margin: 10px auto 5px auto; /* Center and space */
-            position: relative;
-            overflow: hidden;
-            border-radius: 3px;
-        }
-        #volumeLevel {
-            background-color: #4CAF50; /* Green bar */
-            height: 100%;
-            width: 0%; /* Start at 0 */
-            position: absolute;
-            left: 0;
-            top: 0;
-            transition: width 0.05s linear; /* Smooth transition */
-        }
-         /* Hide meter when not streaming */
-        #volumeMeterContainer.hidden {
-            display: none;
-        }
-        #status { margin-top: 0px; font-style: italic; min-height: 1.2em; font-size: 0.9em;}
-        #query-section { flex-grow: 1; padding: 15px; display: flex; flex-direction: column; overflow-y: hidden; }
-        #query-section h2 { margin-top: 0; text-align: center; }
+        /* Basic styling remains the same */
+        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; background-color: #f4f4f4; }
+        #controls { padding: 15px; border-bottom: 1px solid #ccc; background-color: #ffffff; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #controls button { padding: 12px 20px; font-size: 1.1em; cursor: pointer; margin-right: 10px; border-radius: 5px; background-color: #5cb85c; color: white; border: 1px solid #4cae4c;}
+        #controls button:disabled { background-color: #cccccc; border-color: #aaaaaa; cursor: not-allowed;}
+        #toggleAudioButton.listening { background-color: #d9534f; border-color: #d43f3a; } /* Style for stop button */
+        #volumeMeterContainer { height: 20px; width: 90%; max-width: 300px; background-color: #e0e0e0; border: 1px solid #ccc; margin: 10px auto 5px auto; position: relative; overflow: hidden; border-radius: 3px; }
+        #volumeLevel { background-color: #4CAF50; height: 100%; width: 0%; position: absolute; left: 0; top: 0; transition: width 0.05s linear; }
+        #volumeMeterContainer.hidden { display: none; }
+        #status { margin-top: 0px; font-style: italic; min-height: 1.2em; font-size: 0.9em; color: #555; }
+        #query-section { flex-grow: 1; padding: 15px; display: flex; flex-direction: column; overflow-y: hidden; background-color: #ffffff; margin: 10px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        #query-section h2 { margin-top: 0; margin-bottom: 15px; text-align: center; color: #333; }
         #queryInput { width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 1em;}
-        #queryButton { padding: 10px 15px; width: 100%; font-size: 1em; border-radius: 5px; background-color: #4CAF50; color: white; border: none;}
-        #queryResultContainer { flex-grow: 1; overflow-y: auto; margin-top: 15px; border: 1px solid #eee; border-radius: 5px;}
-        #queryResult { white-space: pre-wrap; background-color: #f9f9f9; padding: 10px; min-height: 50px; }
-        .error { color: red; font-weight: bold; }
-        #queryResult a { color: navy; text-decoration: underline; }
+        #queryButton { padding: 10px 15px; width: 100%; font-size: 1em; border-radius: 5px; background-color: #337ab7; color: white; border: none; cursor: pointer; }
+        #queryButton:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #queryResultContainer { flex-grow: 1; overflow-y: auto; margin-top: 15px; border: 1px solid #eee; border-radius: 5px; background-color: #f9f9f9; }
+        #queryResult { white-space: pre-wrap; padding: 10px; min-height: 50px; font-size: 0.95em; line-height: 1.4;}
+        .error { color: #a94442; font-weight: bold; background-color: #f2dede; border-color: #ebccd1; padding: 8px; border-radius: 4px;}
+        #queryResult a { color: #337ab7; text-decoration: underline; }
+        #session-info { font-size: 0.8em; color: #888; text-align: center; padding-bottom: 5px; } /* Style for session ID display */
     </style>
 </head>
 <body>
 
     <div id="controls">
+        <!-- Display Session ID -->
+        <div id="session-info">Session: {{ session_id }}</div>
         <button id="toggleAudioButton">Start Listening</button>
-        <!-- Add the volume meter elements -->
         <div id="volumeMeterContainer" class="hidden">
             <div id="volumeLevel"></div>
         </div>
@@ -71,51 +56,62 @@
         const queryInput = document.getElementById('queryInput');
         const queryButton = document.getElementById('queryButton');
         const queryResultDiv = document.getElementById('queryResult');
-        // Get meter elements
         const volumeMeterContainer = document.getElementById('volumeMeterContainer');
         const volumeLevelDiv = document.getElementById('volumeLevel');
-
+        const sessionInfoDiv = document.getElementById('session-info'); // Get session display div
 
         // --- Config ---
-        const SERVER_URL = `${window.location.hostname}:${window.location.port}`;
+        const SERVER_URL = `${window.location.protocol}//${window.location.hostname}:${window.location.port}`; // Use protocol
         const TARGET_SAMPLE_RATE = 16000;
         const WORKLET_PROCESSOR_NAME = 'audio-processor';
-        const WORKLET_PATH = '/static/audio-processor.js';
+        // IMPORTANT: Adjust WORKLET_PATH if static files are served differently
+        const WORKLET_PATH = '/static/audio-processor.js'; // Assuming default Flask static folder
         const CID_REGEX = /baf[ky][a-z2-7]{50,}/gi;
         const IPFS_GATEWAY = "https://gateway.lighthouse.storage/ipfs/";
+        // *** Get Session ID from Flask template ***
+        const SESSION_ID = "{{ session_id }}"; // Injected by Flask
 
         // --- State ---
         let socket = null;
         let audioContext = null;
         let microphoneNode = null;
         let audioWorkletNode = null;
-        let analyserNode = null; // For volume meter
-        let volumeDataArray = null; // To store volume data
-        let volumeAnimationId = null; // To control animation loop
+        let analyserNode = null;
+        let volumeDataArray = null;
+        let volumeAnimationId = null;
         let isStreaming = false;
         let sourceStream = null;
 
         // --- Socket.IO Connection ---
-        // (connectSocket function remains the same)
         function connectSocket() {
             if (socket && socket.connected) return;
-            updateStatus("Connecting...");
-            socket = io(SERVER_URL);
+            updateStatus("Connecting to server...");
+            // Ensure correct connection URL and path if server uses specific path
+            socket = io(SERVER_URL, {
+                //path: '/socket.io' // Uncomment/adjust if server uses a non-default path
+            });
 
             socket.on('connect', () => {
-                updateStatus("Connected. Ready.");
+                updateStatus("Connected. Joining session...");
+                // *** Emit join_session immediately after connecting ***
+                socket.emit('join_session', { session_id: SESSION_ID });
+                // Enable controls AFTER server confirms join? Or assume join will work? Let's enable optimistically.
                 toggleAudioButton.disabled = false;
                 queryButton.disabled = false;
                 queryInput.disabled = false;
+                updateStatus("Joined session. Ready."); // Update status after join emit
             });
 
             socket.on('disconnect', (reason) => {
                 updateStatus(`Disconnected: ${reason}`, true);
                 if (isStreaming) { forceStopStreamingCleanup(); }
                 toggleAudioButton.textContent = 'Start Listening';
+                toggleAudioButton.classList.remove('listening');
                 toggleAudioButton.disabled = true;
                 queryButton.disabled = true;
                 queryInput.disabled = true;
+                volumeMeterContainer.classList.add('hidden');
+                if (volumeAnimationId) cancelAnimationFrame(volumeAnimationId); volumeAnimationId = null;
             });
 
             socket.on('connect_error', (err) => {
@@ -125,178 +121,346 @@
                 queryInput.disabled = true;
             });
 
+            // General server error
             socket.on('error', (data) => {
-                updateStatus(`Server error: ${data.message}`, true);
+                const errorMsg = data?.message || 'Unknown server error';
+                updateStatus(`Server error: ${errorMsg}`, true);
+                // Consider stopping streaming on critical errors?
+                // if (isStreaming) { forceStopStreamingCleanup(); }
             });
 
-             socket.on('query_result', (data) => {
+            // Query result handler (no changes needed)
+            socket.on('query_result', (data) => {
                 console.log("Query result:", data);
                 queryButton.disabled = false; queryInput.disabled = false;
                 queryResultDiv.classList.remove('error');
                 if (data.processing) { queryResultDiv.textContent = data.answer; }
                 else if (data.error || !data.answer) { queryResultDiv.textContent = `Error: ${data.answer || 'Empty response'}`; queryResultDiv.classList.add('error'); }
                 else {
-                    const rawAnswer = data.answer; queryResultDiv.textContent = rawAnswer;
-                    let currentHtml = queryResultDiv.innerHTML;
+                    // Linkify CIDs (same logic)
+                    const rawAnswer = data.answer;
+                    queryResultDiv.textContent = rawAnswer; // Set text first
+                    let currentHtml = queryResultDiv.innerHTML; // Get HTML version
                     const updatedHtml = currentHtml.replace(CID_REGEX, (cid) => {
                         const linkUrl = `${IPFS_GATEWAY}${cid}`;
                         return `<a href="${linkUrl}" target="_blank" rel="noopener noreferrer">${cid}</a>`;
                     });
-                    queryResultDiv.innerHTML = updatedHtml;
+                    queryResultDiv.innerHTML = updatedHtml; // Update with links
                 }
             });
 
+            // Audio status handlers (logic mostly the same, update UI)
              socket.on('audio_started', () => {
-                if (!isStreaming) { console.log("Ignoring stale audio_started"); return; }
+                // Only react if we are expecting to stream
+                if (!isStreaming) { console.warn("Received 'audio_started' while not expecting to stream."); return; }
                 updateStatus("Streaming audio...");
                 toggleAudioButton.textContent = 'Stop Listening';
+                toggleAudioButton.classList.add('listening'); // Add class for styling
                 toggleAudioButton.disabled = false;
-                // *** Show volume meter ***
                 volumeMeterContainer.classList.remove('hidden');
-                // *** Start volume animation ***
-                drawVolumeMeter();
+                drawVolumeMeter(); // Start volume meter animation
             });
 
             socket.on('audio_stopped', (data) => {
                 const reason = data?.message || "Server initiated stop";
                 updateStatus(`Stopped: ${reason}`);
-                 if (isStreaming) { forceStopStreamingCleanup(); }
+                 // Only perform cleanup if we *were* streaming
+                 if (isStreaming) {
+                    forceStopStreamingCleanup(); // Clean up local resources
+                 }
+                // Update UI regardless of previous state for consistency
                 toggleAudioButton.textContent = 'Start Listening';
-                toggleAudioButton.disabled = !(socket && socket.connected);
-                 // *** Hide volume meter ***
-                 volumeMeterContainer.classList.add('hidden');
-                 // Ensure animation stops if not already stopped
-                 if (volumeAnimationId) { cancelAnimationFrame(volumeAnimationId); volumeAnimationId = null; }
+                toggleAudioButton.classList.remove('listening');
+                toggleAudioButton.disabled = !(socket && socket.connected); // Disable if not connected
+                volumeMeterContainer.classList.add('hidden');
+                if (volumeAnimationId) { cancelAnimationFrame(volumeAnimationId); volumeAnimationId = null; }
             });
+
+            // Handle reconnection events
+            socket.on('reconnecting', (data) => {
+                 updateStatus(`Reconnecting (Attempt ${data.attempt}/${data.max})...`);
+                 toggleAudioButton.disabled = true; // Disable during reconnect
+            });
+            socket.on('reconnected', () => {
+                 updateStatus("Reconnected successfully. Ready.");
+                 toggleAudioButton.disabled = false; // Re-enable button
+                 // Note: Streaming state might be lost, user may need to restart
+                 if (isStreaming) {
+                     // Server might have lost state, safest to stop locally
+                     console.warn("Reconnected, but assuming streaming state lost. Stopping locally.");
+                     forceStopStreamingCleanup();
+                     toggleAudioButton.textContent = 'Start Listening';
+                     toggleAudioButton.classList.remove('listening');
+                     updateStatus("Reconnected. Please start listening again.");
+                 }
+            });
+             socket.on('connection_lost', (data) => {
+                 updateStatus(`Connection lost: ${data.message}. Attempting to reconnect...`, true);
+                 if (isStreaming) { forceStopStreamingCleanup(); } // Stop local streaming on loss
+                 toggleAudioButton.textContent = 'Start Listening';
+                 toggleAudioButton.classList.remove('listening');
+                 toggleAudioButton.disabled = true; // Disable until reconnected
+            });
+
         }
 
         // --- Audio Processing ---
         async function startStreaming() {
-             if (isStreaming || !socket || !socket.connected) return;
+             if (isStreaming || !socket || !socket.connected) {
+                 console.warn("Start streaming called but already streaming or disconnected.");
+                 return;
+             }
              updateStatus("Initializing audio...");
-             toggleAudioButton.disabled = true;
-             try {
-                 if (!audioContext || audioContext.state === 'closed') audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
-                 if (audioContext.state === 'suspended') await audioContext.resume();
-                 if (!audioContext.audioWorklet) { updateStatus("Error: AudioWorklet unavailable (HTTPS required).", true); toggleAudioButton.disabled = false; return; }
-                 try { await audioContext.audioWorklet.addModule(WORKLET_PATH); } catch (e) { updateStatus(`Error: Could not load audio processor. ${e.message}`, true); toggleAudioButton.disabled = false; return; }
+             toggleAudioButton.disabled = true; // Disable button during init
+             isStreaming = true; // Set flag early to handle potential async errors/stops
 
-                 sourceStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: TARGET_SAMPLE_RATE } });
+             try {
+                 // Initialize Audio Context (handle potential previous states)
+                 if (!audioContext || audioContext.state === 'closed') {
+                     console.log("Creating new AudioContext");
+                     audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+                 }
+                 if (audioContext.state === 'suspended') {
+                     console.log("Resuming suspended AudioContext");
+                     await audioContext.resume();
+                 }
+
+                 // Check for AudioWorklet support
+                 if (!audioContext.audioWorklet) {
+                     throw new Error("AudioWorklet is not supported by your browser (HTTPS may be required).");
+                 }
+
+                 // Load the AudioWorklet processor
+                 try {
+                     console.log(`Adding AudioWorklet module from: ${WORKLET_PATH}`);
+                     await audioContext.audioWorklet.addModule(WORKLET_PATH);
+                     console.log("AudioWorklet module added.");
+                 } catch (e) {
+                     console.error("Failed to load AudioWorklet module:", e);
+                     throw new Error(`Could not load audio processor: ${e.message}`);
+                 }
+
+                 // Get microphone access
+                 console.log("Requesting microphone access...");
+                 sourceStream = await navigator.mediaDevices.getUserMedia({
+                     audio: {
+                         echoCancellation: true,
+                         noiseSuppression: true,
+                         sampleRate: TARGET_SAMPLE_RATE // Request desired rate
+                         // autoGainControl: true // Optional
+                     }
+                 });
+                 console.log("Microphone access granted.");
+
+                 // Create nodes
                  microphoneNode = audioContext.createMediaStreamSource(sourceStream);
                  audioWorkletNode = new AudioWorkletNode(audioContext, WORKLET_PROCESSOR_NAME);
-
-                 // *** Create and configure AnalyserNode ***
                  analyserNode = audioContext.createAnalyser();
-                 analyserNode.fftSize = 256; // Smaller size for faster processing, adjust as needed
+                 analyserNode.fftSize = 256; // Smaller size for faster volume updates
                  const bufferLength = analyserNode.frequencyBinCount;
-                 volumeDataArray = new Uint8Array(bufferLength); // Use time domain data
-                 console.log("AnalyserNode created with bufferLength:", bufferLength);
+                 volumeDataArray = new Uint8Array(bufferLength);
+                 console.log("Audio nodes created (Worklet, Analyser). Buffer length:", bufferLength);
 
-                 audioWorkletNode.port.onmessage = (event) => { if (socket && socket.connected && isStreaming) socket.emit('audio_chunk', event.data); };
-                 audioWorkletNode.port.onerror = (event) => { updateStatus(`Audio processing error: ${event.message || 'Unknown'}`, true); stopStreaming(); };
+                 // Setup worklet message handling
+                 audioWorkletNode.port.onmessage = (event) => {
+                     // Send audio chunk only if still streaming and connected
+                     if (socket && socket.connected && isStreaming && event.data instanceof Int16Array) {
+                         // Send the raw Int16Array buffer directly if server expects it
+                         // Or convert to Float32Array/Blob if needed
+                         // Assuming server handles Int16Array buffer (sent as ArrayBuffer)
+                         socket.emit('audio_chunk', event.data.buffer);
+                     }
+                 };
+                 audioWorkletNode.port.onerror = (event) => {
+                     console.error("Audio worklet error:", event);
+                     updateStatus(`Audio processing error: ${event.message || 'Unknown'}`, true);
+                     stopStreaming(); // Stop streaming on worklet error
+                 };
 
-                 // Connect mic -> worklet -> destination
-                 microphoneNode.connect(audioWorkletNode);
-                 audioWorkletNode.connect(audioContext.destination);
-                 // *** Connect mic -> analyser as well ***
+                 // Connect the audio graph: Mic -> Analyser & Mic -> Worklet
+                 // Note: Worklet output often doesn't need connection if just sending data
                  microphoneNode.connect(analyserNode);
-                 // Analyser output doesn't need to go anywhere
+                 microphoneNode.connect(audioWorkletNode);
+                 // audioWorkletNode.connect(audioContext.destination); // Connect to output only if you want to hear the processed audio (usually not needed)
+                 console.log("Audio graph connected.");
 
+                 // Notify the server to start receiving audio
                  socket.emit('start_audio');
-                 isStreaming = true;
                  updateStatus("Waiting for server confirmation...");
-             } catch (err) { updateStatus(`Error: ${err.message}`, true); forceStopStreamingCleanup(); toggleAudioButton.disabled = !(socket && socket.connected); }
+                 // Button state (like text, class) is updated in the 'audio_started' handler
+
+             } catch (err) {
+                 console.error("Error starting audio streaming:", err);
+                 updateStatus(`Error: ${err.message}`, true);
+                 forceStopStreamingCleanup(); // Clean up resources on error
+                 toggleAudioButton.textContent = 'Start Listening'; // Reset button text
+                 toggleAudioButton.classList.remove('listening');
+                 toggleAudioButton.disabled = !(socket && socket.connected); // Re-enable if connected
+             }
          }
 
         function stopStreaming() {
-             if (!isStreaming) return;
-             console.log("User requested stop.");
-             isStreaming = false; // Set immediately
-             if (socket && socket.connected) socket.emit('stop_audio');
-             forceStopStreamingCleanup(); // Local cleanup
+             if (!isStreaming) {
+                 console.warn("Stop streaming called but not currently streaming.");
+                 return;
+             }
+             console.log("User requested stop streaming.");
+             // Immediately update local state and UI to feel responsive
+             isStreaming = false;
              toggleAudioButton.textContent = 'Start Listening';
-             updateStatus("Stopped listening.");
+             toggleAudioButton.classList.remove('listening');
+             updateStatus("Stopping listening...");
+
+             // Notify server (if connected)
+             if (socket && socket.connected) {
+                 socket.emit('stop_audio');
+             } else {
+                 console.warn("Cannot send stop_audio, socket not connected.");
+             }
+
+             // Perform local cleanup
+             forceStopStreamingCleanup();
+             // Re-enable button if connected
              toggleAudioButton.disabled = !(socket && socket.connected);
-             // Hiding meter happens in 'audio_stopped' handler or forceStopStreamingCleanup
         }
 
         function forceStopStreamingCleanup() {
-             console.log("Cleaning up audio resources...");
+             console.log("Performing local audio resource cleanup...");
              isStreaming = false; // Ensure flag is false
 
-             // *** Cancel volume animation ***
+             // Stop volume meter animation
              if (volumeAnimationId) {
                  cancelAnimationFrame(volumeAnimationId);
                  volumeAnimationId = null;
                  console.log("Volume animation cancelled.");
              }
-              // *** Hide and reset volume meter ***
+             // Hide and reset meter
              volumeMeterContainer.classList.add('hidden');
              volumeLevelDiv.style.width = '0%';
 
+             // Stop microphone tracks
+             if (sourceStream) {
+                 sourceStream.getTracks().forEach(track => track.stop());
+                 sourceStream = null;
+                 console.log("Microphone stream tracks stopped.");
+             }
 
-             if (audioWorkletNode) { audioWorkletNode.port.onmessage = null; audioWorkletNode.port.onerror = null; try { audioWorkletNode.disconnect(); } catch(e){} audioWorkletNode = null; console.log("Worklet disconnected."); }
-             if (analyserNode) { try { analyserNode.disconnect(); } catch(e){} analyserNode = null; console.log("Analyser disconnected."); } // *** Disconnect analyser ***
-             if (microphoneNode) { try { microphoneNode.disconnect(); } catch(e){} microphoneNode = null; console.log("Mic node disconnected."); }
-             if (sourceStream) { sourceStream.getTracks().forEach(track => track.stop()); sourceStream = null; console.log("Mic stream stopped."); }
+             // Disconnect nodes (check existence and disconnect safely)
+             if (audioWorkletNode) {
+                 // Remove listeners before disconnecting
+                 audioWorkletNode.port.onmessage = null;
+                 audioWorkletNode.port.onerror = null;
+                 try { audioWorkletNode.disconnect(); } catch(e){ console.warn("Error disconnecting worklet:", e); }
+                 audioWorkletNode = null; // Clear reference
+                 console.log("Worklet node disconnected.");
+             }
+              if (analyserNode) {
+                 try { analyserNode.disconnect(); } catch(e){ console.warn("Error disconnecting analyser:", e); }
+                 analyserNode = null; // Clear reference
+                 console.log("Analyser node disconnected.");
+             }
+             if (microphoneNode) {
+                 try { microphoneNode.disconnect(); } catch(e){ console.warn("Error disconnecting mic node:", e); }
+                 microphoneNode = null; // Clear reference
+                 console.log("Microphone node disconnected.");
+             }
+
+
+             // We typically don't close the AudioContext unless the whole app is closing
+             // Closing it prematurely might cause issues if the user wants to start again quickly.
+             // if (audioContext && audioContext.state !== 'closed') {
+             //     audioContext.close().then(() => console.log("AudioContext closed."));
+             //     audioContext = null;
+             // }
 
              console.log("Audio cleanup finished.");
         }
 
-        // --- NEW: Volume Meter Drawing Function ---
+        // --- Volume Meter Drawing ---
+        // (No changes needed)
         function drawVolumeMeter() {
-            // Request the next frame
             volumeAnimationId = requestAnimationFrame(drawVolumeMeter);
+            if (!analyserNode || !volumeDataArray || !isStreaming) { // Added !isStreaming check
+                 // Ensure animation stops if we are no longer streaming
+                 if (volumeAnimationId) {
+                     cancelAnimationFrame(volumeAnimationId);
+                     volumeAnimationId = null;
+                 }
+                 return;
+             };
 
-            if (!analyserNode || !volumeDataArray) return;
-
-            // Get time domain data
             analyserNode.getByteTimeDomainData(volumeDataArray);
-
-            // Calculate a simple volume metric (e.g., max deviation from midpoint)
             let maxVal = 0;
             for (let i = 0; i < volumeDataArray.length; i++) {
-                // Values are 0-255, midpoint is 128
                 const deviation = Math.abs(volumeDataArray[i] - 128);
-                if (deviation > maxVal) {
-                    maxVal = deviation;
-                }
+                if (deviation > maxVal) maxVal = deviation;
             }
-
-            // Normalize maxVal (0-128) to a percentage (0-100)
-            const volumePercent = (maxVal / 128) * 100;
-
-            // Update the width of the volume level div
+            const volumePercent = Math.min(100, (maxVal / 128) * 150); // Amplify slightly, cap at 100
             volumeLevelDiv.style.width = volumePercent + '%';
         }
 
 
         // --- Query Handling ---
-        // (Keep sendQuery as before)
+        // (No changes needed)
          function sendQuery() {
              const query = queryInput.value.trim();
              if (!query) { queryResultDiv.textContent = "Please enter a query."; queryResultDiv.classList.add('error'); return; }
-             if (!socket || !socket.connected) { queryResultDiv.textContent = "Not connected."; queryResultDiv.classList.add('error'); return; }
-             queryResultDiv.textContent = "Sending query..."; queryResultDiv.classList.remove('error');
-             queryButton.disabled = true; queryInput.disabled = true;
-             socket.emit('query_graph', { query: query });
+             if (!socket || !socket.connected) { queryResultDiv.textContent = "Not connected to server."; queryResultDiv.classList.add('error'); return; }
+
+             queryResultDiv.textContent = "Sending query...";
+             queryResultDiv.classList.remove('error');
+             queryButton.disabled = true;
+             queryInput.disabled = true; // Disable input while querying
+             socket.emit('query_graph', { query: query }); // Server knows session via SID
          }
 
         // --- Status Update ---
-        // (Keep updateStatus as before)
+        // (No changes needed)
         function updateStatus(message, isError = false) {
-            console.log(`Status: ${message}`);
+            // console.log(`Status: ${message}`); // Keep console log for debugging
             statusDiv.textContent = `Status: ${message}`;
             statusDiv.className = isError ? 'error' : '';
         }
 
         // --- Event Listeners ---
-        // (Keep event listeners as before)
-        toggleAudioButton.addEventListener('click', () => { if (!isStreaming) startStreaming(); else stopStreaming(); });
+        // (No changes needed)
+        toggleAudioButton.addEventListener('click', () => {
+            if (!isStreaming) {
+                startStreaming();
+            } else {
+                stopStreaming();
+            }
+        });
         queryButton.addEventListener('click', sendQuery);
-        queryInput.addEventListener('keypress', (event) => { if (event.key === 'Enter') { event.preventDefault(); sendQuery(); } });
-        document.addEventListener('DOMContentLoaded', () => { connectSocket(); toggleAudioButton.disabled = true; queryButton.disabled = true; queryInput.disabled = true; });
-        window.addEventListener('beforeunload', () => { if (socket) socket.disconnect(); });
+        queryInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault(); // Prevent form submission if inside one
+                sendQuery();
+            }
+        });
+
+        // Initial setup on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            // Display session ID from template immediately
+            if (sessionInfoDiv && SESSION_ID) {
+                 sessionInfoDiv.textContent = `Session: ${SESSION_ID.substring(0, 8)}...`;
+            }
+            connectSocket(); // Start connection process
+            // Disable buttons until connected and session joined
+            toggleAudioButton.disabled = true;
+            queryButton.disabled = true;
+            queryInput.disabled = true;
+            updateStatus("Initializing...");
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (socket) {
+                socket.disconnect(); // Attempt graceful disconnect
+            }
+            // Ensure local audio resources are stopped if page is closed abruptly
+            forceStopStreamingCleanup();
+        });
 
     </script>
 </body>
