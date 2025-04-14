@@ -2,6 +2,8 @@
 import eventlet # For sleep
 from flask import request
 from flask_socketio import emit, join_room, leave_room, disconnect
+import threading # For threading in audio handler
+from queue import Queue, Full as QueueFull, Empty as QueueEmpty 
 
 # Import necessary components from other modules
 from logger_setup import logger, get_log_prefix
@@ -240,6 +242,24 @@ def register_handlers(socketio):
         # Pass client_state directly to termination function
         terminate_audio_session(client_state.session_id, sid, client_state)
 
+        # ---> ADD THIS BLOCK START <---
+        # Explicitly clear the audio queue *after* termination cleanup and *before* starting
+        # the new manager to prevent the new sender from consuming a leftover None signal.
+        logger.debug(f"{log_prefix} Explicitly clearing audio queue before starting new manager...")
+        try:
+            q = client_state.audio_queue
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done() # Mark task done for items removed
+                except QueueEmpty:
+                    break # Should not happen if not empty, but safety break
+            logger.debug(f"{log_prefix} Audio queue cleared.")
+        except Exception as e:
+            # Log error but proceed, hoping the queue isn't problematic
+            logger.warning(f"{log_prefix} Error during explicit audio queue clear: {e}", exc_info=False)
+        # ---> ADD THIS BLOCK END <---
+
         # Start new session
         logger.info(f"{log_prefix} Received 'start_audio'. Starting fresh audio session.")
         client_state.is_receiving_audio = True # Set flag **before** starting thread
@@ -254,7 +274,6 @@ def register_handlers(socketio):
         thread.start()
         logger.info(f"{log_prefix} Audio manager thread started (ID: {thread.ident}).")
         # Note: 'audio_started' event is sent by the manager thread via status_queue
-
 
     @socketio.on('stop_audio')
     def handle_stop_audio():

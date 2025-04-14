@@ -271,7 +271,6 @@ async def manage_live_session(session_id: str, sid: str, client_state: 'ClientSt
                     retry_count += 1
                     # Clear the potentially invalid session object ref before retry
                     client_state.live_session_object = None
-                    continue # To next retry iteration
 
             # --- Post-Session Handling (Clean Exit from `async with session`) ---
             logger.warning(f"{log_prefix} Google session ended cleanly or tasks completed unexpectedly. Incrementing retry count.")

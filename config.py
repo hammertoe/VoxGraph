@@ -141,8 +141,8 @@ NAMESPACES = {
     "xsd": XSD,
     "ex": EX
 }
-TRANSCRIPTION_TYPE_URI = EX.Transcription
-PROVENANCE_PREDICATE_URI = EX.derivedFromTranscript
+TRANSCRIPTION_TYPE_URI = URIRef(str(EX) + "Transcription") # Construct full URI
+PROVENANCE_PREDICATE_URI = URIRef(str(EX) + "derivedFromTranscript") # Construct full URI
 
 # --- Sanity Checks ---
 if not GOOGLE_API_KEY:

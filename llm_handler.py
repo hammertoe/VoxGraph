@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-import google.generativeai as genai
-from google.generativeai import types as genai_types
+from google import genai as genai
+from google.genai import types as genai_types
 from google.api_core import exceptions as google_exceptions
 import config
 from logger_setup import logger, get_log_prefix
